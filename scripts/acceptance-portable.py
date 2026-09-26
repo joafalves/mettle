@@ -131,6 +131,27 @@ def main() -> None:
         relative = f"examples/language/{name}.mettle"
         run("run", relative, "--raw", environment=example_environment)
         run("test", relative, "--quiet", environment=example_environment)
+    jobs = run(
+        "run",
+        "examples/language/jobs.mettle",
+        "--all",
+        "--jobs",
+        "2",
+        "--output",
+        "json",
+        environment=example_environment,
+    )
+    job_records = [json.loads(line) for line in jobs.stdout.splitlines()]
+    assert job_records[0]["jobs"] == 2, job_records
+    assert sorted(record["sourceIndex"] for record in job_records[1:-1]) == [1, 2, 3], job_records
+    run(
+        "test",
+        "examples/language/jobs.mettle",
+        "--jobs",
+        "2",
+        "--quiet",
+        environment=example_environment,
+    )
     example_environment["API_TOKEN"] = "safe-demo-token"
     run("run", "examples/language/secrets.mettle", "--raw", environment=example_environment)
     run("test", "examples/language/secrets.mettle", "--quiet", environment=example_environment)

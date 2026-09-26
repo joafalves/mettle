@@ -455,10 +455,13 @@ Calling a flow does not imply assertion collection, a CI exit status, or a test 
 The first test model is implemented: `test("name") { ... }` declares a
 parameterless test that may call flows, perform I/O, and use `assert(...)`.
 Tests do not return values and cannot be called as flows. `mettle test <file>`
-executes the tests in that file in source order, reports each result and a
-summary, and exits nonzero if any test fails or the selected file has no tests. `mettle run --all` remains
-exclusively for zero-argument flows. Assertion messages, tags, filters, and
-aggregate assertion collection remain future work.
+executes the tests in that file sequentially by default; `--jobs N` runs up to
+`N` independent tests concurrently. Results remain atomic and carry their
+source index when reported in completion order. The command exits nonzero if
+any test fails or the selected file has no tests. `mettle run --all --jobs N`
+provides the same bounded scheduling exclusively for zero-argument flows.
+Assertion messages, tags, filters, and aggregate assertion collection remain
+future work.
 
 ### Driving a flow from an operation result
 

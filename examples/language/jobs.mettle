@@ -1,0 +1,31 @@
+// File-level jobs are a CLI scheduling feature; the language stays unchanged.
+// Try:
+//   mettle run examples/language/jobs.mettle --all --jobs 3
+//   mettle test examples/language/jobs.mettle --jobs 3
+
+flow users = {
+    resource: "users"
+    ready: true
+}
+
+flow orders = {
+    resource: "orders"
+    ready: true
+}
+
+flow inventory = {
+    resource: "inventory"
+    ready: true
+}
+
+test "users are ready" {
+    assert(users().ready)
+}
+
+test "orders are ready" {
+    assert(orders().ready)
+}
+
+test "inventory is ready" {
+    assert(inventory().ready)
+}

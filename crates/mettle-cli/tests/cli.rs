@@ -2,8 +2,9 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::process::{ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static TEMPORARY_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -933,14 +934,209 @@ fn all_json_output_is_atomic_json_lines_with_batch_records() {
     assert_eq!(records[0]["eligible"], 2);
     assert_eq!(records[0]["skipped"], 1);
     assert_eq!(records[1]["type"], "result");
+    assert_eq!(records[1]["sourceIndex"], 1);
     assert_eq!(records[1]["flow"], "first");
     assert_eq!(records[1]["result"], "one");
     assert_eq!(records[2]["type"], "result");
+    assert_eq!(records[2]["sourceIndex"], 2);
     assert_eq!(records[2]["flow"], "second");
     assert_eq!(records[3]["type"], "summary");
     assert_eq!(records[3]["passed"], 2);
     assert_eq!(records[3]["failed"], 0);
     assert_eq!(records[3]["skipped"], 1);
+}
+
+#[test]
+fn jobs_overlap_entries_respect_the_limit_and_report_completion_order() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("local server should bind");
+    let address = listener.local_addr().expect("server address");
+    let active = Arc::new(AtomicUsize::new(0));
+    let maximum = Arc::new(AtomicUsize::new(0));
+    let server_active = active.clone();
+    let server_maximum = maximum.clone();
+    let server = std::thread::spawn(move || {
+        let mut handlers = Vec::new();
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().expect("request should arrive");
+            let active = server_active.clone();
+            let maximum = server_maximum.clone();
+            handlers.push(std::thread::spawn(move || {
+                let mut request = [0_u8; 1024];
+                let bytes = stream.read(&mut request).expect("request should be readable");
+                let request = String::from_utf8_lossy(&request[..bytes]);
+                let delay = if request.contains(" /slow ") {
+                    Duration::from_millis(250)
+                } else if request.contains(" /fast ") {
+                    Duration::from_millis(20)
+                } else {
+                    Duration::from_millis(60)
+                };
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(current, Ordering::SeqCst);
+                std::thread::sleep(delay);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}")
+                    .expect("response should be writable");
+                active.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for handler in handlers {
+            handler.join().expect("request handler should complete");
+        }
+    });
+    let path = source_file(&format!(
+        "flow first = http.get(\"http://{address}/slow\")\nflow second = http.get(\"http://{address}/fast\")\nflow third = http.get(\"http://{address}/medium\")\n"
+    ));
+    let output = Command::new(env!("CARGO_BIN_EXE_mettle"))
+        .arg("run")
+        .arg(&path)
+        .args(["--all", "--jobs", "2", "--output", "json"])
+        .output()
+        .expect("batch should start");
+    fs::remove_file(path).expect("test source should be removable");
+    server.join().expect("server should complete");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(maximum.load(Ordering::SeqCst), 2);
+    let records = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("JSON record"))
+        .collect::<Vec<_>>();
+    assert_eq!(records[0]["jobs"], 2);
+    assert_eq!(records[1]["sourceIndex"], 2);
+    assert_eq!(records[2]["sourceIndex"], 3);
+    assert_eq!(records[3]["sourceIndex"], 1);
+    assert_eq!(records[4]["passed"], 3);
+}
+
+#[test]
+fn jobs_reject_invalid_or_ambiguous_invocations() {
+    let path = source_file("flow first = 1\nflow second = 2\ntest(\"works\") {}\n");
+    let cases = [
+        vec!["run", "PATH", "--all", "--jobs", "0"],
+        vec!["run", "PATH", "--all", "--jobs", "many"],
+        vec!["run", "PATH", "first", "--jobs", "2"],
+        vec!["run", "PATH", "--all", "--jobs", "2", "--raw"],
+        vec!["test", "PATH", "works", "--jobs", "2"],
+    ];
+    for arguments in cases {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_mettle"));
+        for argument in arguments {
+            if argument == "PATH" {
+                command.arg(&path);
+            } else {
+                command.arg(argument);
+            }
+        }
+        let output = command.output().expect("invalid command should finish");
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("--jobs"),
+            "{output:?}"
+        );
+    }
+    fs::remove_file(path).expect("test source should be removable");
+}
+
+#[test]
+fn jobs_apply_to_file_test_batches_and_add_source_indexes() {
+    let path = source_file("test(\"first\") {}\ntest(\"second\") {}\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_mettle"))
+        .arg("test")
+        .arg(&path)
+        .args(["--jobs", "2", "--output", "json"])
+        .output()
+        .expect("tests should start");
+    fs::remove_file(path).expect("test source should be removable");
+
+    assert!(output.status.success(), "{output:?}");
+    let records = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("JSON record"))
+        .collect::<Vec<_>>();
+    assert_eq!(records[0]["jobs"], 2);
+    let mut indexes = records[1..3]
+        .iter()
+        .map(|record| record["sourceIndex"].as_u64().expect("source index"))
+        .collect::<Vec<_>>();
+    indexes.sort_unstable();
+    assert_eq!(indexes, vec![1, 2]);
+    assert_eq!(records[3]["passed"], 2);
+}
+
+#[test]
+fn project_jobs_share_the_selected_profile_and_preserve_redaction() {
+    let directory = project_directory();
+    fs::write(directory.join("mettle.toml"), "name = \"jobs-project\"\n")
+        .expect("manifest should be writable");
+    fs::write(directory.join(".env"), "PROFILE_LABEL=default\n")
+        .expect("default environment should be writable");
+    fs::write(
+        directory.join(".env.qa"),
+        "PROFILE_LABEL=qa\nMETTLE_JOBS_SECRET=hidden-jobs-token\n",
+    )
+    .expect("profile should be writable");
+    fs::write(
+        directory.join("shared.mettle"),
+        "flow helper(value) = value\n",
+    )
+    .expect("shared source should be writable");
+    let entry = directory.join("main.mettle");
+    fs::write(
+        &entry,
+        "flow first = helper(env(\"PROFILE_LABEL\"))\n\
+         flow second { echo(senv(\"METTLE_JOBS_SECRET\"))\n env(\"PROFILE_LABEL\") }\n\
+         test \"first uses qa\" { assert(first() == \"qa\") }\n\
+         test \"second uses qa\" { assert(second() == \"qa\") }\n",
+    )
+    .expect("entry source should be writable");
+    for command in ["run", "test"] {
+        let mut invocation = Command::new(env!("CARGO_BIN_EXE_mettle"));
+        invocation.arg(command).arg(&entry);
+        if command == "run" {
+            invocation.arg("--all");
+        }
+        let output = invocation
+            .args(["--jobs", "2", "--profile", "qa", "--output", "json"])
+            .env_remove("PROFILE_LABEL")
+            .env_remove("METTLE_JOBS_SECRET")
+            .output()
+            .expect("project batch should finish");
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!stdout.contains("hidden-jobs-token"), "{stdout}");
+        assert!(stdout.contains("[REDACTED]"), "{stdout}");
+        let records = stdout
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("JSON record"))
+            .collect::<Vec<_>>();
+        assert_eq!(records[0]["eligible"], 2);
+        assert_eq!(records.last().expect("summary")["passed"], 2);
+        if command == "run" {
+            assert!(records[1..3].iter().all(|record| record["result"] == "qa"));
+        }
+    }
+    fs::remove_dir_all(directory).expect("project should be removable");
+}
+
+#[test]
+fn concurrent_failure_header_and_diagnostics_use_the_same_stream() {
+    let path = source_file("flow broken = fail(\"stopped deliberately\")\nflow healthy = \"ok\"\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_mettle"))
+        .arg("run")
+        .arg(&path)
+        .args(["--all", "--jobs", "2", "--no-color"])
+        .output()
+        .expect("batch should finish");
+    fs::remove_file(path).expect("source should be removable");
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("Flow 2/2 · healthy"), "{stdout}");
+    assert!(!stdout.contains("Flow 1/2 · broken"), "{stdout}");
+    assert!(stderr.contains("Flow 1/2 · broken"), "{stderr}");
+    assert!(stderr.contains("stopped deliberately"), "{stderr}");
+    assert!(stdout.contains("Passed: 1   Failed: 1"), "{stdout}");
 }
 
 #[test]
@@ -1001,7 +1197,7 @@ fn terminal_fail_does_not_stop_other_batch_entries() {
     let output = Command::new(env!("CARGO_BIN_EXE_mettle"))
         .args(["run"])
         .arg(&path)
-        .args(["--all", "--output", "json"])
+        .args(["--all", "--jobs", "2", "--output", "json"])
         .output()
         .expect("batch should start");
     fs::remove_file(path).expect("test source should be removable");
@@ -1012,11 +1208,19 @@ fn terminal_fail_does_not_stop_other_batch_entries() {
         .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("JSON line"))
         .collect::<Vec<_>>();
     assert_eq!(records.len(), 4);
-    assert_eq!(records[1]["type"], "failure");
-    assert_eq!(records[1]["error"]["message"], "preflight stopped");
-    assert_eq!(records[1]["error"]["terminal"], true);
-    assert_eq!(records[2]["type"], "result");
-    assert_eq!(records[2]["flow"], "healthy");
+    let failure = records
+        .iter()
+        .find(|record| record["type"] == "failure")
+        .expect("failure record");
+    assert_eq!(failure["error"]["message"], "preflight stopped");
+    assert_eq!(failure["error"]["terminal"], true);
+    assert_eq!(failure["sourceIndex"], 1);
+    let success = records
+        .iter()
+        .find(|record| record["type"] == "result")
+        .expect("result record");
+    assert_eq!(success["flow"], "healthy");
+    assert_eq!(success["sourceIndex"], 2);
     assert_eq!(records[3]["failed"], 1);
 }
 

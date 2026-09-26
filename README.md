@@ -163,17 +163,30 @@ mettle list examples/http/requests.mettle
 mettle run examples/http/requests.mettle --line 4
 ```
 
-Run every zero-argument flow in source order with `--all`. Parameterized flows
-are deliberately skipped, so this is useful for a collection of self-contained
-checks. Each flow still performs its real I/O; Mettle continues after a failed
-flow and returns a nonzero status if any executed flow fails. Human output ends
-with a batch summary. `--output json` emits JSON Lines: a `start` record, one
-atomic `result` or `failure` record per executed flow, and a final `summary`
-record.
+Run every zero-argument flow with `--all`. Parameterized flows are deliberately
+skipped, so this is useful for a collection of self-contained checks. The
+default `--jobs 1` executes entries sequentially in source order. Set a larger
+job count to run independent entries concurrently:
 
 ```bash
 mettle run checks.mettle --all
+mettle run checks.mettle --all --jobs 4
 ```
+
+At most `N` entries run at once. Each has isolated bindings, context, events,
+and workload metrics. Mettle continues after a failed entry and returns a
+nonzero status if any entry fails. With concurrent jobs, completed entries are
+printed in completion order and their headers retain the original source index.
+Human output remains atomic per entry and ends with a batch summary.
+`--output json` emits JSON Lines: one `start` record, one atomic `result` or
+`failure` record per completed entry, and one `summary`. Each entry record has
+a one-based `sourceIndex`, so consumers can restore declaration order.
+Concurrent human runs announce the entry count and job limit before execution.
+Failure headers and diagnostics stay together on stderr; successful reports
+are written to stdout. Ctrl+C retains completed results and ends a batch with
+an interrupted summary separating cancelled entries from those not started.
+`--raw` is intentionally rejected when `--jobs` is greater than one because
+unlabelled, completion-ordered values would be ambiguous.
 
 ## Write executable tests
 
@@ -186,9 +199,12 @@ error stops the current test but preserves any earlier assertion failures.
 Assertions inside ordinary flows still fail immediately. `mettle test <file>`
 runs tests declared in that file in source order;
 `mettle test <file> "test name"` or `mettle test <file> --line <line>` runs one test;
-`mettle run <file> --all` still runs only zero-argument flows. The test command
-exits nonzero when any test fails or the file has no tests, and supports `--verbose`, `--quiet`, and
-`--output json` (JSON Lines) for CI.
+`mettle run <file> --all` still runs only zero-argument flows. Use
+`mettle test <file> --jobs 4` to run independent file tests concurrently;
+selected individual tests do not accept `--jobs`. The test command exits
+nonzero when any test fails or the file has no tests, and supports `--verbose`,
+`--quiet`, and `--output json` (JSON Lines) for CI. Keep the default
+`--jobs 1` when tests depend on shared external state or intentional ordering.
 
 Use `fail("reason")` when an entry cannot continue. Unlike a collected test
 assertion, it stops the current flow or test immediately and keeps earlier
@@ -387,7 +403,7 @@ flow readiness() {
 }
 ```
 
-`parallel` with unnamed branches returns an array in source order; named branches return an object keyed by their labels. Without `limit`, all branches may start; with it, no more than `limit` start at once. If a branch fails, active siblings are cancelled and joined. `retry` counts the first execution as an attempt and reruns its entire block—including assertions—until it succeeds or exhausts its attempts; terminal `fail(...)` bypasses retry. `within` covers all nested work, including retry delays. Ctrl+C cancels the root execution and exits with status 130.
+`parallel` with unnamed branches returns an array in source order; named branches return an object keyed by their labels. Without `limit`, all branches may start; with it, no more than `limit` start at once. If a branch fails, active siblings are cancelled and joined. `retry` counts the first execution as an attempt and reruns its entire block—including assertions—until it succeeds or exhausts its attempts; terminal `fail(...)` bypasses retry. `within` covers all nested work, including retry delays. Ctrl+C cancels and joins every active top-level job, stops admitting queued entries, and exits with status 130.
 
 This gives every operation an owner, a lifetime, and a cleanup path. A flow that works as a functional check can run inside a load test without duplicating its operations.
 
@@ -560,7 +576,10 @@ and raw modes keep their existing minimal output. JSON reports carry ordered,
 redacted `events` inside each atomic flow or test record. In workload iterations,
 the CLI retains at most 50 messages per run and reports how many were omitted,
 keeping load-test output bounded. Messages are collected until the top-level
-flow finishes; `--all` therefore keeps each flow's output together. There is no
+flow finishes; `--all --jobs N` therefore keeps each completed flow's output
+together even when several entries execute concurrently. `--jobs` schedules
+independent top-level entries; the language-level `parallel` expression owns
+cooperating branches inside one entry. There is no
 separate `debug()` or debug mode yet. Try the network-free
 [echo example](examples/language/echo.mettle) with `mettle run examples/language/echo.mettle`.
 

@@ -25,8 +25,8 @@ Mettle language tools
 Usage:
   mettle check <file>
   mettle list <file> [--json]
-  mettle run <file> [flow-name] [--all | --line <line>] [--arg <name=value>]... [--profile <name>] [output options]
-  mettle test <file> [test-name | --line <line>] [--profile <name>] [--verbose | --quiet | --output json] [--no-progress] [--no-color]
+  mettle run <file> [flow-name] [--all | --line <line>] [--jobs <count>] [--arg <name=value>]... [--profile <name>] [output options]
+  mettle test <file> [test-name | --line <line>] [--jobs <count>] [--profile <name>] [--verbose | --quiet | --output json] [--no-progress] [--no-color]
   mettle lsp
   mettle --help
   mettle --version
@@ -40,6 +40,7 @@ Commands:
 
 Run output options:
   --profile NAME  Overlay .env.NAME from the entry folder and project root
+  --jobs COUNT    Run up to COUNT file-level entries concurrently (batch forms only)
   --verbose       Show the complete result and operation details
   --quiet         Print only the final flow status
   --raw           Print only the returned Mettle value
@@ -52,7 +53,9 @@ mod env_file;
 mod lsp;
 mod report;
 
-use report::{CliObserver, ExecutionReport, display_duration, failure_summary, raw_value};
+use report::{
+    CapturedEvents, CliObserver, ExecutionReport, display_duration, failure_summary, raw_value,
+};
 
 const CAPABILITIES: &[CapabilityDescriptor] = &[HTTP_DESCRIPTOR];
 
@@ -61,6 +64,7 @@ struct RunOptions {
     selector: Option<MettleSelector>,
     all: bool,
     arguments: Vec<(String, String)>,
+    jobs: Option<usize>,
     profile: Option<String>,
     output: OutputMode,
     progress: bool,
@@ -73,6 +77,7 @@ impl Default for RunOptions {
             selector: None,
             all: false,
             arguments: Vec::new(),
+            jobs: None,
             profile: None,
             output: OutputMode::Human,
             progress: true,
@@ -95,6 +100,39 @@ enum MettleSelector {
     Name(String),
     Line(usize),
     Id(usize),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BatchKind {
+    Flows,
+    Tests,
+}
+
+#[derive(Debug)]
+struct EntrySpec {
+    flow_id: usize,
+    source_index: usize,
+    arguments: Vec<Value>,
+}
+
+struct EntryOutcome {
+    flow_id: usize,
+    source_index: usize,
+    duration: Duration,
+    captured: CapturedEvents,
+    result: Result<Value, RuntimeError>,
+}
+
+struct ActiveEntry {
+    flow_id: usize,
+    source_index: usize,
+    started: Instant,
+    observer: Arc<CliObserver>,
+}
+
+enum BatchEvent {
+    Interrupted,
+    Joined(Box<Option<Result<(tokio::task::Id, EntryOutcome), tokio::task::JoinError>>>),
 }
 
 fn main() -> ExitCode {
@@ -191,6 +229,10 @@ fn parse_run_options(arguments: &[OsString]) -> Result<RunOptions, CliError> {
                 parse_profile_option(arguments.get(cursor + 1), &mut options)?;
                 cursor += 2;
             }
+            "--jobs" => {
+                parse_jobs_option(arguments.get(cursor + 1), &mut options)?;
+                cursor += 2;
+            }
             "--flow-id" => {
                 let value = arguments
                     .get(cursor + 1)
@@ -236,6 +278,26 @@ fn parse_run_options(arguments: &[OsString]) -> Result<RunOptions, CliError> {
         }
     }
     Ok(options)
+}
+
+fn parse_jobs_option(value: Option<&OsString>, options: &mut RunOptions) -> Result<(), CliError> {
+    let value = value
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| CliError::Usage("`--jobs` requires a count".to_owned()))?;
+    let jobs = value
+        .parse::<usize>()
+        .map_err(|_| CliError::Usage("`--jobs` requires a positive integer".to_owned()))?;
+    if jobs == 0 {
+        return Err(CliError::Usage(
+            "`--jobs` requires a positive integer".to_owned(),
+        ));
+    }
+    if options.jobs.replace(jobs).is_some() {
+        return Err(CliError::Usage(
+            "`--jobs` was supplied more than once".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_output_format(value: Option<&OsString>, options: &mut RunOptions) -> Result<(), CliError> {
@@ -396,8 +458,20 @@ fn list_flows(path: &Path, json: bool) -> Result<(), CliError> {
 }
 
 fn run(path: &Path, options: &RunOptions) -> Result<(), CliError> {
+    if options.jobs.is_some() && !options.all {
+        return Err(CliError::Usage(
+            "`--jobs` is only valid with `mettle run <file> --all`".to_owned(),
+        ));
+    }
+    let jobs = options.jobs.unwrap_or(1);
+    if jobs > 1 && options.output == OutputMode::Raw {
+        return Err(CliError::Usage(
+            "`--raw` cannot be combined with `--jobs` greater than 1; use human or JSON output"
+                .to_owned(),
+        ));
+    }
     let project = load_project(path)?;
-    let plan = compile_project(&project)?;
+    let plan = Arc::new(compile_project(&project)?);
     let environment = execution_environment(&project, options.profile.as_deref())?;
     let flow_ids = if options.all {
         if !options.arguments.is_empty() {
@@ -446,30 +520,35 @@ fn run(path: &Path, options: &RunOptions) -> Result<(), CliError> {
                 "type": "start",
                 "eligible": flow_ids.len(),
                 "skipped": skipped,
+                "jobs": jobs.min(flow_ids.len()),
             })
         );
     }
-    let mut passed = 0;
-    let mut failed = 0;
     let total = flow_ids.len();
-    for (index, flow_id) in flow_ids.into_iter().enumerate() {
-        if options.all {
-            print_all_flow_separator(options, index + 1, total, &plan.flows[flow_id].display_name);
-        }
-        match run_flow(
-            &project,
-            &plan,
-            flow_id,
-            if options.all { &[] } else { &options.arguments },
-            options,
-            &async_runtime,
-            &environment,
-        ) {
-            Ok(()) => passed += 1,
-            Err(CliError::Failure) if options.all => failed += 1,
-            Err(error) => return Err(error),
-        }
-    }
+    let entries = flow_ids
+        .into_iter()
+        .enumerate()
+        .map(|(index, flow_id)| {
+            Ok(EntrySpec {
+                flow_id,
+                source_index: index + 1,
+                arguments: resolve_arguments(
+                    &plan.flows[flow_id],
+                    if options.all { &[] } else { &options.arguments },
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, CliError>>()?;
+    let (passed, failed) = async_runtime.block_on(execute_entries(
+        &project,
+        plan,
+        entries,
+        options,
+        environment,
+        options.all.then_some(BatchKind::Flows),
+        total,
+        jobs,
+    ))?;
     if options.all {
         print_all_summary(options, passed, failed, skipped, batch_started.elapsed());
     }
@@ -481,18 +560,10 @@ fn run(path: &Path, options: &RunOptions) -> Result<(), CliError> {
 }
 
 fn run_tests(path: &Path, options: &RunOptions) -> Result<(), CliError> {
-    if options.all
-        || matches!(options.selector, Some(MettleSelector::Id(_)))
-        || !options.arguments.is_empty()
-        || options.output == OutputMode::Raw
-    {
-        return Err(CliError::Usage(
-            "`mettle test` accepts a test name or `--line` selector, plus output options"
-                .to_owned(),
-        ));
-    }
+    validate_test_options(options)?;
+    let jobs = options.jobs.unwrap_or(1);
     let project = load_project(path)?;
-    let plan = compile_project(&project)?;
+    let plan = Arc::new(compile_project(&project)?);
     let environment = execution_environment(&project, options.profile.as_deref())?;
     let available_test_ids = plan
         .flows
@@ -537,6 +608,37 @@ fn run_tests(path: &Path, options: &RunOptions) -> Result<(), CliError> {
         }
         return Err(CliError::Failure);
     }
+    run_selected_tests(&project, plan, environment, test_ids, options, jobs)
+}
+
+fn validate_test_options(options: &RunOptions) -> Result<(), CliError> {
+    if options.all
+        || matches!(options.selector, Some(MettleSelector::Id(_)))
+        || !options.arguments.is_empty()
+        || options.output == OutputMode::Raw
+    {
+        return Err(CliError::Usage(
+            "`mettle test` accepts a test name or `--line` selector, plus output options"
+                .to_owned(),
+        ));
+    }
+    if options.jobs.is_some() && options.selector.is_some() {
+        return Err(CliError::Usage(
+            "`--jobs` is only valid when running every test in a file".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn run_selected_tests(
+    project: &LoadedProject,
+    plan: Arc<ExecutionPlan>,
+    environment: Arc<HashMap<String, String>>,
+    test_ids: Vec<usize>,
+    options: &RunOptions,
+    jobs: usize,
+) -> Result<(), CliError> {
+    let total = test_ids.len();
     let async_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -548,33 +650,34 @@ fn run_tests(path: &Path, options: &RunOptions) -> Result<(), CliError> {
     if options.output == OutputMode::Json {
         println!(
             "{}",
-            serde_json::json!({ "type": "start", "kind": "test", "eligible": total })
+            serde_json::json!({
+                "type": "start",
+                "kind": "test",
+                "eligible": total,
+                "jobs": jobs.min(total),
+            })
         );
     }
-    let mut passed = 0;
-    let mut failed = 0;
-    for (index, test_id) in test_ids.into_iter().enumerate() {
-        if matches!(options.output, OutputMode::Human | OutputMode::Verbose) {
-            println!(
-                "\n------------------------------------------------------------------------\nTest {}/{total} · {}\n------------------------------------------------------------------------",
-                index + 1,
-                plan.flows[test_id].display_name
-            );
-        }
-        match run_flow(
-            &project,
-            &plan,
-            test_id,
-            &[],
-            options,
-            &async_runtime,
-            &environment,
-        ) {
-            Ok(()) => passed += 1,
-            Err(CliError::Failure) => failed += 1,
-            Err(error) => return Err(error),
-        }
-    }
+    let entries = test_ids
+        .into_iter()
+        .enumerate()
+        .map(|(index, flow_id)| EntrySpec {
+            flow_id,
+            source_index: index + 1,
+            arguments: Vec::new(),
+        })
+        .collect();
+    let batch_kind = options.selector.is_none().then_some(BatchKind::Tests);
+    let (passed, failed) = async_runtime.block_on(execute_entries(
+        project,
+        plan,
+        entries,
+        options,
+        environment,
+        batch_kind,
+        total,
+        jobs,
+    ))?;
     print_test_summary(options, passed, failed, started.elapsed());
     if failed > 0 {
         Err(CliError::Failure)
@@ -604,103 +707,377 @@ fn print_test_summary(options: &RunOptions, passed: usize, failed: usize, durati
     }
 }
 
-fn print_all_flow_separator(options: &RunOptions, index: usize, total: usize, display_name: &str) {
+fn print_entry_separator(
+    options: &RunOptions,
+    kind: BatchKind,
+    index: usize,
+    total: usize,
+    display_name: &str,
+    error_stream: bool,
+) {
     if matches!(options.output, OutputMode::Human | OutputMode::Verbose) {
+        let label = match kind {
+            BatchKind::Flows => "Flow",
+            BatchKind::Tests => "Test",
+        };
+        let header = format!(
+            "\n------------------------------------------------------------------------\n{label} {index}/{total} · {display_name}\n------------------------------------------------------------------------"
+        );
+        if error_stream {
+            eprintln!("{header}");
+        } else {
+            println!("{header}");
+        }
+    }
+}
+
+fn spawn_entry(
+    join_set: &mut tokio::task::JoinSet<EntryOutcome>,
+    plan: Arc<ExecutionPlan>,
+    spec: EntrySpec,
+    environment: Arc<HashMap<String, String>>,
+    sources: Arc<[String]>,
+    progress: bool,
+) -> (tokio::task::Id, ActiveEntry) {
+    let observer = Arc::new(CliObserver::new(progress).with_sources(sources));
+    let started = Instant::now();
+    let active = ActiveEntry {
+        flow_id: spec.flow_id,
+        source_index: spec.source_index,
+        started,
+        observer: observer.clone(),
+    };
+    let handle = join_set.spawn(async move {
+        let mettle_runtime = Runtime::new(vec![Arc::new(HttpCapability::new())])
+            .with_observer(observer.clone())
+            .with_environment(environment);
+        let result = mettle_runtime
+            .execute_selected(&plan, spec.flow_id, spec.arguments)
+            .await;
+        observer.clear_progress();
+        EntryOutcome {
+            flow_id: spec.flow_id,
+            source_index: spec.source_index,
+            duration: started.elapsed(),
+            captured: observer.take_events(),
+            result,
+        }
+    });
+    (handle.id(), active)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn execute_entries(
+    project: &LoadedProject,
+    plan: Arc<ExecutionPlan>,
+    entries: Vec<EntrySpec>,
+    options: &RunOptions,
+    environment: Arc<HashMap<String, String>>,
+    batch_kind: Option<BatchKind>,
+    total: usize,
+    jobs: usize,
+) -> Result<(usize, usize), CliError> {
+    let mut pending = std::collections::VecDeque::from(entries);
+    let sources: Arc<[String]> = Arc::from(
+        project
+            .sources
+            .iter()
+            .map(|source| source.text.clone())
+            .collect::<Vec<_>>(),
+    );
+    let progress = jobs == 1
+        && options.progress
+        && matches!(options.output, OutputMode::Human | OutputMode::Verbose);
+    let batch_started = Instant::now();
+    if jobs > 1
+        && batch_kind.is_some()
+        && matches!(options.output, OutputMode::Human | OutputMode::Verbose)
+    {
         println!(
-            "\n------------------------------------------------------------------------\nFlow {index}/{total} · {display_name}\n------------------------------------------------------------------------"
+            "Running {total} entries with up to {} concurrent jobs…",
+            jobs.min(total)
+        );
+    }
+    let mut join_set = tokio::task::JoinSet::new();
+    let mut active = HashMap::new();
+    while active.len() < jobs {
+        let Some(spec) = pending.pop_front() else {
+            break;
+        };
+        let (task_id, entry) = spawn_entry(
+            &mut join_set,
+            plan.clone(),
+            spec,
+            environment.clone(),
+            sources.clone(),
+            progress,
+        );
+        active.insert(task_id, entry);
+    }
+
+    let mut interrupt = Box::pin(tokio::signal::ctrl_c());
+    let mut passed = 0;
+    let mut failed = 0;
+    while !active.is_empty() {
+        let event = std::future::poll_fn(|task| {
+            if interrupt.as_mut().poll(task).is_ready() {
+                return Poll::Ready(BatchEvent::Interrupted);
+            }
+            match join_set.poll_join_next_with_id(task) {
+                Poll::Ready(result) => Poll::Ready(BatchEvent::Joined(Box::new(result))),
+                Poll::Pending => Poll::Pending,
+            }
+        })
+        .await;
+        match event {
+            BatchEvent::Interrupted => {
+                join_set.abort_all();
+                while let Some(result) = join_set.join_next_with_id().await {
+                    if let Ok((task_id, outcome)) = result {
+                        active.remove(&task_id);
+                        if outcome.result.is_ok() {
+                            passed += 1;
+                        } else {
+                            failed += 1;
+                        }
+                        print_entry_outcome(project, &plan, options, batch_kind, total, outcome);
+                    }
+                }
+                let mut cancelled = active.into_values().collect::<Vec<_>>();
+                cancelled.sort_by_key(|entry| entry.source_index);
+                for entry in &cancelled {
+                    print_cancellation(&plan, options, batch_kind, total, entry);
+                }
+                if let Some(kind) = batch_kind {
+                    let skipped = if matches!(kind, BatchKind::Flows) {
+                        plan.flows
+                            .iter()
+                            .filter(|flow| {
+                                flow.kind == DeclarationKind::Flow
+                                    && flow.span.source == project.entry_source
+                                    && !flow.parameters.is_empty()
+                            })
+                            .count()
+                    } else {
+                        0
+                    };
+                    print_interrupted_summary(
+                        options,
+                        kind,
+                        [passed, failed, cancelled.len(), pending.len(), skipped],
+                        batch_started.elapsed(),
+                    );
+                }
+                return Err(CliError::Interrupted);
+            }
+            BatchEvent::Joined(result) => match *result {
+                Some(Ok((task_id, outcome))) => {
+                    active.remove(&task_id);
+                    let succeeded = outcome.result.is_ok();
+                    print_entry_outcome(project, &plan, options, batch_kind, total, outcome);
+                    if succeeded {
+                        passed += 1;
+                    } else {
+                        failed += 1;
+                    }
+                    if let Some(spec) = pending.pop_front() {
+                        let (task_id, entry) = spawn_entry(
+                            &mut join_set,
+                            plan.clone(),
+                            spec,
+                            environment.clone(),
+                            sources.clone(),
+                            progress,
+                        );
+                        active.insert(task_id, entry);
+                    }
+                }
+                Some(Err(error)) => {
+                    active.remove(&error.id());
+                    join_set.abort_all();
+                    while join_set.join_next().await.is_some() {}
+                    eprintln!("error: an execution job failed internally: {error}");
+                    return Err(CliError::Failure);
+                }
+                None => break,
+            },
+        }
+    }
+    Ok((passed, failed))
+}
+
+fn print_interrupted_summary(
+    options: &RunOptions,
+    kind: BatchKind,
+    counts: [usize; 5],
+    duration: Duration,
+) {
+    let [passed, failed, cancelled, not_started, skipped] = counts;
+    if options.output == OutputMode::Json {
+        let mut summary = serde_json::json!({
+            "type": "summary",
+            "status": "interrupted",
+            "eligible": passed + failed + cancelled + not_started,
+            "passed": passed,
+            "failed": failed,
+            "cancelled": cancelled,
+            "notStarted": not_started,
+            "durationNanos": u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX),
+        });
+        if matches!(kind, BatchKind::Tests) {
+            summary["kind"] = serde_json::json!("test");
+        } else {
+            summary["skipped"] = serde_json::json!(skipped);
+        }
+        println!("{summary}");
+    } else if options.output != OutputMode::Raw {
+        let label = match kind {
+            BatchKind::Flows => "Batch",
+            BatchKind::Tests => "Test",
+        };
+        let skipped_line = if matches!(kind, BatchKind::Flows) {
+            format!("\n  Skipped: {skipped}")
+        } else {
+            String::new()
+        };
+        println!(
+            "\n========================================================================\n{label} summary · Interrupted\n  Passed: {passed}   Failed: {failed}   Cancelled: {cancelled}   Not started: {not_started}{skipped_line}\n  Duration: {}\n========================================================================",
+            display_duration(duration)
         );
     }
 }
 
-fn run_flow(
-    project: &LoadedProject,
+fn print_cancellation(
     plan: &ExecutionPlan,
-    flow_id: usize,
-    supplied_arguments: &[(String, String)],
     options: &RunOptions,
-    async_runtime: &tokio::runtime::Runtime,
-    environment: &Arc<HashMap<String, String>>,
-) -> Result<(), CliError> {
-    let arguments = resolve_arguments(&plan.flows[flow_id], supplied_arguments)?;
-    let observer = Arc::new(
-        CliObserver::new(
-            options.progress && matches!(options.output, OutputMode::Human | OutputMode::Verbose),
-        )
-        .with_sources(
-            project
-                .sources
-                .iter()
-                .map(|source| source.text.clone())
-                .collect(),
-        ),
-    );
-    let mettle_runtime = Runtime::new(vec![Arc::new(HttpCapability::new())])
-        .with_observer(observer.clone())
-        .with_environment(environment.clone());
-    let started = Instant::now();
-    let outcome = async_runtime.block_on(async {
-        let mut execution = Box::pin(mettle_runtime.execute_selected(plan, flow_id, arguments));
-        let mut interrupt = Box::pin(tokio::signal::ctrl_c());
-        std::future::poll_fn(|task| {
-            if let Poll::Ready(result) = execution.as_mut().poll(task) {
-                return Poll::Ready(Some(result));
-            }
-            if interrupt.as_mut().poll(task).is_ready() {
-                return Poll::Ready(None);
-            }
-            Poll::Pending
-        })
-        .await
-    });
-    let Some(result) = outcome else {
-        observer.clear_progress();
-        let captured = observer.take_events();
-        if options.output == OutputMode::Json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "type": "cancelled",
-                    "flow": plan.flows[flow_id].display_name,
-                    "durationNanos": u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                    "events": report::events_json(&captured.events, captured.omitted_workload_echoes),
-                    "workloads": report::workloads_json(&captured.workloads),
-                    "omittedWorkloads": captured.omitted_workloads,
-                })
-            );
-        } else if matches!(options.output, OutputMode::Human | OutputMode::Verbose) {
-            let color =
-                options.color && io::stderr().is_terminal() && env::var_os("NO_COLOR").is_none();
+    batch_kind: Option<BatchKind>,
+    total: usize,
+    entry: &ActiveEntry,
+) {
+    entry.observer.clear_progress();
+    let captured = entry.observer.take_events();
+    let flow = &plan.flows[entry.flow_id];
+    if let Some(kind) = batch_kind {
+        print_entry_separator(
+            options,
+            kind,
+            entry.source_index,
+            total,
+            &flow.display_name,
+            true,
+        );
+    } else if flow.kind == DeclarationKind::Test {
+        print_entry_separator(
+            options,
+            BatchKind::Tests,
+            1,
+            total,
+            &flow.display_name,
+            true,
+        );
+    }
+    if options.output == OutputMode::Json {
+        let mut output = if flow.kind == DeclarationKind::Test {
+            serde_json::json!({
+                "type": "cancelled",
+                "kind": "test",
+                "test": flow.display_name,
+                "durationNanos": u64::try_from(entry.started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                "events": report::events_json(&captured.events, captured.omitted_workload_echoes),
+                "workloads": report::workloads_json(&captured.workloads),
+                "omittedWorkloads": captured.omitted_workloads,
+            })
+        } else {
+            serde_json::json!({
+                "type": "cancelled",
+                "flow": flow.display_name,
+                "durationNanos": u64::try_from(entry.started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                "events": report::events_json(&captured.events, captured.omitted_workload_echoes),
+                "workloads": report::workloads_json(&captured.workloads),
+                "omittedWorkloads": captured.omitted_workloads,
+            })
+        };
+        if batch_kind.is_some() {
+            output
+                .as_object_mut()
+                .expect("cancellation report is an object")
+                .insert(
+                    "sourceIndex".to_owned(),
+                    serde_json::json!(entry.source_index),
+                );
+        }
+        println!("{output}");
+    } else if matches!(options.output, OutputMode::Human | OutputMode::Verbose) {
+        let color =
+            options.color && io::stderr().is_terminal() && env::var_os("NO_COLOR").is_none();
+        eprintln!(
+            "{}",
+            report::cancellation_summary(
+                &flow.display_name,
+                &captured.events,
+                captured.omitted_workload_echoes,
+                color
+            )
+        );
+        if !captured.workloads.is_empty() {
             eprintln!(
                 "{}",
-                report::cancellation_summary(
-                    &plan.flows[flow_id].display_name,
-                    &captured.events,
-                    captured.omitted_workload_echoes,
-                    color
-                )
+                report::workloads_result(&captured.workloads, captured.omitted_workloads, color)
             );
-            if !captured.workloads.is_empty() {
-                eprintln!(
-                    "{}",
-                    report::workloads_result(
-                        &captured.workloads,
-                        captured.omitted_workloads,
-                        color
-                    )
-                );
-            }
-        } else {
-            eprintln!("execution cancelled");
         }
-        return Err(CliError::Interrupted);
-    };
-    observer.clear_progress();
-    match result {
-        Ok(value) => {
-            print_success(plan, flow_id, options, started, &observer, &value);
-            Ok(())
-        }
-        Err(error) => print_failure(project, plan, flow_id, options, started, &observer, &error),
+    } else {
+        eprintln!("execution cancelled");
+    }
+}
+
+fn print_entry_outcome(
+    project: &LoadedProject,
+    plan: &ExecutionPlan,
+    options: &RunOptions,
+    batch_kind: Option<BatchKind>,
+    total: usize,
+    outcome: EntryOutcome,
+) {
+    if let Some(kind) = batch_kind {
+        print_entry_separator(
+            options,
+            kind,
+            outcome.source_index,
+            total,
+            &plan.flows[outcome.flow_id].display_name,
+            outcome.result.is_err(),
+        );
+    } else if plan.flows[outcome.flow_id].kind == DeclarationKind::Test {
+        print_entry_separator(
+            options,
+            BatchKind::Tests,
+            1,
+            total,
+            &plan.flows[outcome.flow_id].display_name,
+            outcome.result.is_err(),
+        );
+    }
+    let source_index = batch_kind.map(|_| outcome.source_index);
+    match outcome.result {
+        Ok(value) => print_success(
+            plan,
+            outcome.flow_id,
+            options,
+            outcome.duration,
+            &outcome.captured,
+            &value,
+            source_index,
+        ),
+        Err(error) => print_failure(
+            project,
+            plan,
+            outcome.flow_id,
+            options,
+            outcome.duration,
+            &outcome.captured,
+            &error,
+            source_index,
+        ),
     }
 }
 
@@ -708,14 +1085,14 @@ fn print_success(
     plan: &ExecutionPlan,
     flow_id: usize,
     options: &RunOptions,
-    started: Instant,
-    observer: &CliObserver,
+    duration: Duration,
+    captured: &CapturedEvents,
     value: &Value,
+    source_index: Option<usize>,
 ) {
-    let captured = observer.take_events();
     let report = ExecutionReport {
         flow: &plan.flows[flow_id].display_name,
-        duration: started.elapsed(),
+        duration,
         result: value,
         events: &captured.events,
         omitted_workload_echoes: captured.omitted_workload_echoes,
@@ -732,43 +1109,57 @@ fn print_success(
         OutputMode::Verbose => report.human(true, color),
         OutputMode::Quiet => report.quiet(color),
         OutputMode::Raw => raw_value(value),
-        OutputMode::Json if is_test => serde_json::json!({
-            "type": "result",
-            "kind": "test",
-            "test": plan.flows[flow_id].display_name,
-            "status": "passed",
-            "durationNanos": u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            "events": report::events_json(&captured.events, captured.omitted_workload_echoes),
-            "workloads": report::workloads_json(&captured.workloads),
-            "omittedWorkloads": captured.omitted_workloads,
-        })
-        .to_string(),
-        OutputMode::Json if options.all => serde_json::json!({
-            "type": "result",
-            "flow": plan.flows[flow_id].display_name,
-            "durationNanos": u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            "result": report::value_json(value),
-            "events": report::events_json(&captured.events, captured.omitted_workload_echoes),
-            "workloads": report::workloads_json(&captured.workloads),
-            "omittedWorkloads": captured.omitted_workloads,
-        })
-        .to_string(),
+        OutputMode::Json if is_test => json_with_source_index(
+            serde_json::json!({
+                "type": "result",
+                "kind": "test",
+                "test": plan.flows[flow_id].display_name,
+                "status": "passed",
+                "durationNanos": u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX),
+                "events": report::events_json(&captured.events, captured.omitted_workload_echoes),
+                "workloads": report::workloads_json(&captured.workloads),
+                "omittedWorkloads": captured.omitted_workloads,
+            }),
+            source_index,
+        ),
+        OutputMode::Json if options.all => json_with_source_index(
+            serde_json::json!({
+                "type": "result",
+                "flow": plan.flows[flow_id].display_name,
+                "durationNanos": u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX),
+                "result": report::value_json(value),
+                "events": report::events_json(&captured.events, captured.omitted_workload_echoes),
+                "workloads": report::workloads_json(&captured.workloads),
+                "omittedWorkloads": captured.omitted_workloads,
+            }),
+            source_index,
+        ),
         OutputMode::Json => report.json(),
     };
     println!("{output}");
 }
 
-#[allow(clippy::too_many_lines)]
+fn json_with_source_index(mut output: serde_json::Value, source_index: Option<usize>) -> String {
+    if let Some(source_index) = source_index {
+        output
+            .as_object_mut()
+            .expect("execution report is an object")
+            .insert("sourceIndex".to_owned(), serde_json::json!(source_index));
+    }
+    output.to_string()
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn print_failure(
     project: &LoadedProject,
     plan: &ExecutionPlan,
     flow_id: usize,
     options: &RunOptions,
-    started: Instant,
-    observer: &CliObserver,
+    duration: Duration,
+    captured: &CapturedEvents,
     error: &RuntimeError,
-) -> Result<(), CliError> {
-    let captured = observer.take_events();
+    source_index: Option<usize>,
+) {
     if options.output == OutputMode::Json {
         let source = project
             .sources
@@ -777,7 +1168,7 @@ fn print_failure(
         let (line, column) = source_location(&source.text, error.span.start);
         let mut output = serde_json::json!({
             "flow": plan.flows[flow_id].display_name,
-            "durationNanos": u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            "durationNanos": u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX),
             "events": report::events_json(&captured.events, captured.omitted_workload_echoes),
             "workloads": report::workloads_json(&captured.workloads),
             "omittedWorkloads": captured.omitted_workloads,
@@ -829,8 +1220,14 @@ fn print_failure(
                 .expect("execution report is an object")
                 .insert("type".to_owned(), serde_json::json!("failure"));
         }
+        if let Some(source_index) = source_index {
+            output
+                .as_object_mut()
+                .expect("execution report is an object")
+                .insert("sourceIndex".to_owned(), serde_json::json!(source_index));
+        }
         println!("{output}");
-        return Err(CliError::Failure);
+        return;
     }
     let color = options.color && io::stderr().is_terminal() && env::var_os("NO_COLOR").is_none();
     eprintln!(
@@ -884,14 +1281,13 @@ fn print_failure(
             report::scope_label(&error.scope_path).trim_end()
         );
     }
-    Err(CliError::Failure)
 }
 
 fn print_all_empty(options: &RunOptions, skipped: usize) {
     if options.output == OutputMode::Json {
         println!(
             "{}",
-            serde_json::json!({ "type": "start", "eligible": 0, "skipped": skipped })
+            serde_json::json!({ "type": "start", "eligible": 0, "skipped": skipped, "jobs": 0 })
         );
         println!(
             "{}",

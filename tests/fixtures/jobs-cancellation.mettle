@@ -1,0 +1,11 @@
+use context {
+    defaults http {
+        timeout: 30s
+        headers: { Authorization: "Bearer local-test-token" }
+    }
+}
+
+flow completed = "keep this result"
+flow activeOne = http.get("${METTLE_BASE_URL}/hang")
+flow activeTwo = http.get("${METTLE_BASE_URL}/hang")
+flow queued = fail("this entry must not start after cancellation")

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::{self, IsTerminal as _, Write as _};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mettle_capability::{OperationReport, ReportOutcome, ReportSection, Value};
@@ -152,7 +152,7 @@ pub struct CliObserver {
     state: Mutex<ObserverState>,
     progress: bool,
     interactive: bool,
-    sources: Vec<String>,
+    sources: Arc<[String]>,
 }
 
 impl CliObserver {
@@ -161,12 +161,12 @@ impl CliObserver {
             state: Mutex::new(ObserverState::default()),
             progress,
             interactive: io::stderr().is_terminal(),
-            sources: Vec::new(),
+            sources: Arc::from(Vec::<String>::new()),
         }
     }
 
-    pub fn with_sources(mut self, sources: Vec<String>) -> Self {
-        self.sources = sources;
+    pub fn with_sources(mut self, sources: impl Into<Arc<[String]>>) -> Self {
+        self.sources = sources.into();
         self
     }
 

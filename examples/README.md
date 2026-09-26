@@ -4,6 +4,17 @@ Run these commands from the repository root after installing the `mettle` CLI.
 Use `mettle check <file>` to validate a file without running it. In VS Code,
 open any `.mettle` file to use its flow/test play buttons.
 
+File-level batches are sequential by default. When their entries are
+independent, add `--jobs N` to run a bounded number concurrently:
+
+```bash
+mettle test examples/http/tests.mettle --jobs 2
+mettle run examples/http/requests.mettle --all --jobs 3
+```
+
+Parameterized flows are skipped by `run --all`. Keep `--jobs 1` for entries
+that intentionally share or mutate external state.
+
 ## Language
 
 The standalone language files below require no network access.
@@ -15,6 +26,7 @@ The standalone language files below require no network access.
 | [Contexts](language/contexts.mettle) | Reusable and anonymous file-level contexts | `mettle run examples/language/contexts.mettle` |
 | [Collections and numbers](language/collections-and-numbers.mettle) | Named parallel work, `for` mapping, retries, numeric literals | `mettle test examples/language/collections-and-numbers.mettle` |
 | [Echo](language/echo.mettle) | Report messages and named parallel labels | `mettle run examples/language/echo.mettle` |
+| [Top-level jobs](language/jobs.mettle) | Bounded concurrent flow and test batches | `mettle test examples/language/jobs.mettle --jobs 3` |
 | [Secrets](language/secrets.mettle) | `senv()` and redaction | `mettle run examples/language/secrets.mettle` |
 | [Standalone profiles](language/profiles/main.mettle) | Automatic `.env` and `--profile` overlays | `mettle run examples/language/profiles/main.mettle --profile qa` |
 
