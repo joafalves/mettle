@@ -1120,6 +1120,157 @@ fn project_jobs_share_the_selected_profile_and_preserve_redaction() {
 }
 
 #[test]
+fn project_job_defaults_are_command_specific_and_cli_values_override_them() {
+    let directory = project_directory();
+    fs::write(
+        directory.join("mettle.toml"),
+        "name = \"configured\"\nversion = \"0.1\"\n[run]\njobs = 2\n[test]\njobs = 3\n",
+    )
+    .expect("manifest should be writable");
+    let nested = directory.join("checks");
+    fs::create_dir(&nested).expect("entry directory should be creatable");
+    let entry = nested.join("main.mettle");
+    fs::write(
+        &entry,
+        "flow main = \"one\"\nflow second = \"two\"\nflow third = \"three\"\n\
+         test \"first\" {}\ntest \"second\" {}\ntest \"third\" {}\n",
+    )
+    .expect("entry should be writable");
+    for (command, cli_jobs, expected) in [
+        ("run", None, 2),
+        ("test", None, 3),
+        ("run", Some("1"), 1),
+        ("test", Some("2"), 2),
+    ] {
+        let mut invocation = Command::new(env!("CARGO_BIN_EXE_mettle"));
+        invocation
+            .current_dir(std::env::temp_dir())
+            .arg(command)
+            .arg(&entry);
+        if command == "run" {
+            invocation.arg("--all");
+        }
+        if let Some(jobs) = cli_jobs {
+            invocation.args(["--jobs", jobs]);
+        }
+        let output = invocation
+            .args(["--output", "json"])
+            .output()
+            .expect("batch should finish");
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let start: serde_json::Value =
+            serde_json::from_str(stdout.lines().next().expect("start")).expect("JSON start record");
+        assert_eq!(start["jobs"], expected, "{stdout}");
+    }
+    for args in [
+        vec!["run", "main", "--raw"],
+        vec!["test", "first", "--quiet"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_mettle"))
+            .arg(args[0])
+            .arg(&entry)
+            .args(&args[1..])
+            .output()
+            .expect("selection should finish");
+        assert!(output.status.success(), "{output:?}");
+    }
+    let parallel_raw = Command::new(env!("CARGO_BIN_EXE_mettle"))
+        .arg("run")
+        .arg(&entry)
+        .args(["--all", "--raw"])
+        .output()
+        .expect("run should finish");
+    assert_eq!(parallel_raw.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&parallel_raw.stderr).contains("--jobs 1"));
+    let sequential_raw = Command::new(env!("CARGO_BIN_EXE_mettle"))
+        .arg("run")
+        .arg(&entry)
+        .args(["--all", "--raw", "--jobs", "1"])
+        .output()
+        .expect("run should finish");
+    assert!(sequential_raw.status.success(), "{sequential_raw:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&sequential_raw.stdout).trim(),
+        "one\ntwo\nthree"
+    );
+    fs::remove_dir_all(directory).expect("project should be removable");
+}
+
+#[test]
+fn project_config_rejects_invalid_toml_keys_and_job_counts() {
+    let directory = project_directory();
+    let entry = directory.join("main.mettle");
+    fs::write(&entry, "flow main = true\ntest \"works\" {}\n").expect("entry should be writable");
+    for invalid in [
+        "[run]\njobs = 0\n",
+        "[test]\njobs = -1\n",
+        "[run]\njobs = 1.5\n",
+        "[test]\njobs = \"2\"\n",
+        "[run]\njob = 2\n",
+        "[runner]\njobs = 2\n",
+        "[run]\njobs = 2\njobs = 3\n",
+        "[run\njobs = 2\n",
+    ] {
+        fs::write(directory.join("mettle.toml"), invalid).expect("manifest should be writable");
+        for command in ["check", "list", "run", "test"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_mettle"))
+                .arg(command)
+                .arg(&entry)
+                .output()
+                .expect("command should finish");
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{command}: {invalid}: {output:?}"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("invalid project configuration"), "{stderr}");
+            assert!(stderr.contains("mettle.toml"), "{stderr}");
+            assert!(output.stdout.is_empty(), "{output:?}");
+        }
+    }
+    fs::remove_dir_all(directory).expect("project should be removable");
+}
+
+#[test]
+fn project_job_defaults_use_the_nearest_manifest_without_parent_inheritance() {
+    let directory = project_directory();
+    fs::write(
+        directory.join("mettle.toml"),
+        "[run]\njobs = 2\n[test]\njobs = 2\n",
+    )
+    .expect("outer manifest should be writable");
+    let nested = directory.join("nested");
+    fs::create_dir(&nested).expect("nested project should be creatable");
+    fs::write(nested.join("mettle.toml"), "name = \"nested\"\n")
+        .expect("nested manifest should be writable");
+    let entry = nested.join("main.mettle");
+    fs::write(
+        &entry,
+        "flow first = 1\nflow second = 2\ntest \"first\" {}\ntest \"second\" {}\n",
+    )
+    .expect("entry should be writable");
+    for command in ["run", "test"] {
+        let mut invocation = Command::new(env!("CARGO_BIN_EXE_mettle"));
+        invocation.arg(command).arg(&entry);
+        if command == "run" {
+            invocation.arg("--all");
+        }
+        let output = invocation
+            .args(["--output", "json"])
+            .output()
+            .expect("batch should finish");
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let start: serde_json::Value =
+            serde_json::from_str(stdout.lines().next().expect("start")).expect("JSON start record");
+        assert_eq!(start["jobs"], 1, "{stdout}");
+    }
+    fs::remove_dir_all(directory).expect("project should be removable");
+}
+
+#[test]
 fn concurrent_failure_header_and_diagnostics_use_the_same_stream() {
     let path = source_file("flow broken = fail(\"stopped deliberately\")\nflow healthy = \"ok\"\n");
     let output = Command::new(env!("CARGO_BIN_EXE_mettle"))

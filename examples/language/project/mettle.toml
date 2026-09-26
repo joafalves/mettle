@@ -1,2 +1,10 @@
 name = "language-project-example"
 version = "0.1"
+
+[test]
+# File-level tests use two jobs unless --jobs overrides this default.
+jobs = 2
+
+[run]
+# Applies to run --all, never to one selected flow.
+jobs = 2

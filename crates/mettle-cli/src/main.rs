@@ -40,7 +40,7 @@ Commands:
 
 Run output options:
   --profile NAME  Overlay .env.NAME from the entry folder and project root
-  --jobs COUNT    Run up to COUNT file-level entries concurrently (batch forms only)
+  --jobs COUNT    Override the project's job limit for a file-level batch (default: 1)
   --verbose       Show the complete result and operation details
   --quiet         Print only the final flow status
   --raw           Print only the returned Mettle value
@@ -51,6 +51,7 @@ Run output options:
 
 mod env_file;
 mod lsp;
+mod project_config;
 mod report;
 
 use report::{
@@ -463,14 +464,17 @@ fn run(path: &Path, options: &RunOptions) -> Result<(), CliError> {
             "`--jobs` is only valid with `mettle run <file> --all`".to_owned(),
         ));
     }
-    let jobs = options.jobs.unwrap_or(1);
+    let project = load_project(path)?;
+    let jobs = if options.all {
+        options.jobs.unwrap_or_else(|| project.config.run.jobs())
+    } else {
+        1
+    };
     if jobs > 1 && options.output == OutputMode::Raw {
         return Err(CliError::Usage(
-            "`--raw` cannot be combined with `--jobs` greater than 1; use human or JSON output"
-                .to_owned(),
+            "`--raw` requires one job; use `--jobs 1` or choose human or JSON output".to_owned(),
         ));
     }
-    let project = load_project(path)?;
     let plan = Arc::new(compile_project(&project)?);
     let environment = execution_environment(&project, options.profile.as_deref())?;
     let flow_ids = if options.all {
@@ -561,8 +565,12 @@ fn run(path: &Path, options: &RunOptions) -> Result<(), CliError> {
 
 fn run_tests(path: &Path, options: &RunOptions) -> Result<(), CliError> {
     validate_test_options(options)?;
-    let jobs = options.jobs.unwrap_or(1);
     let project = load_project(path)?;
+    let jobs = if options.selector.is_none() {
+        options.jobs.unwrap_or_else(|| project.config.test.jobs())
+    } else {
+        1
+    };
     let plan = Arc::new(compile_project(&project)?);
     let environment = execution_environment(&project, options.profile.as_deref())?;
     let available_test_ids = plan
@@ -1565,10 +1573,22 @@ struct LoadedProject {
     program: mettle_syntax::Program,
     sources: Vec<SourceDocument>,
     entry_source: usize,
+    config: project_config::ProjectConfig,
 }
 
 fn load_project(path: &Path) -> Result<LoadedProject, CliError> {
-    load_project_with_overlays(path, &HashMap::new())
+    let mut project = load_project_with_overlays(path, &HashMap::new())?;
+    let entry = &project.sources[project.entry_source].path;
+    let root = if entry == Path::new("<stdin>") {
+        None
+    } else {
+        entry.parent().and_then(find_project_root)
+    };
+    project.config = project_config::load(root.as_deref()).map_err(|message| {
+        eprintln!("error: {message}");
+        CliError::Failure
+    })?;
+    Ok(project)
 }
 
 fn execution_environment(
@@ -1752,6 +1772,7 @@ fn combine_parsed_sources(
         program,
         sources: documents,
         entry_source,
+        config: project_config::ProjectConfig::default(),
     }
 }
 

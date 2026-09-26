@@ -165,7 +165,8 @@ mettle run examples/http/requests.mettle --line 4
 
 Run every zero-argument flow with `--all`. Parameterized flows are deliberately
 skipped, so this is useful for a collection of self-contained checks. The
-default `--jobs 1` executes entries sequentially in source order. Set a larger
+default `--jobs 1` executes entries sequentially in source order unless the
+project sets a different default in `mettle.toml`. Set a larger
 job count to run independent entries concurrently:
 
 ```bash
@@ -197,7 +198,7 @@ optional and may interpolate values. A test collects false assertions and report
 each one with its source location, then continues to the next test. A runtime
 error stops the current test but preserves any earlier assertion failures.
 Assertions inside ordinary flows still fail immediately. `mettle test <file>`
-runs tests declared in that file in source order;
+runs tests declared in that file sequentially unless `[test].jobs` configures concurrency;
 `mettle test <file> "test name"` or `mettle test <file> --line <line>` runs one test;
 `mettle run <file> --all` still runs only zero-argument flows. Use
 `mettle test <file> --jobs 4` to run independent file tests concurrently;
@@ -438,6 +439,42 @@ and latency; the final report retains the same workload grouping.
 ## Organize a project without import boilerplate
 
 A `mettle.toml` file marks a project root. Running an entry file below it discovers every `.mettle` file in that project. Files contribute declarations directly, so there are no import or export lists to maintain.
+
+The manifest also supports separate default job counts for flow and test batches:
+
+```toml
+name = "service-checks"
+version = "0.1.0"
+
+[test]
+jobs = 4
+
+[run]
+jobs = 2
+```
+
+`[test].jobs` applies to `mettle test <file>`; `[run].jobs` applies to
+`mettle run <file> --all`. Explicit `--jobs N` overrides the project default,
+and omitted settings default to `1`. Selecting a single flow or test ignores
+the batch default and still runs only that entry. Defaults come from the nearest
+project root, independently of the shell's working directory; nested projects
+do not inherit settings from a parent project.
+
+Job counts must be positive integers. Malformed TOML, unknown keys, and invalid
+values are reported with the manifest path and source location. Supported root
+keys are `name`, `version`, `run`, and `test`; each execution table currently
+accepts only `jobs`. Profiles and output modes remain explicit invocation
+options. In projects configured for concurrent flow batches, use
+`--jobs 1 --raw` when you want sequential raw output.
+
+The editor's **Run All** and **Run Tests in File** actions use these defaults
+automatically. Try the network-free project checks:
+
+```bash
+mettle run examples/language/project/checks.mettle --all
+mettle test examples/language/project/checks.mettle
+mettle test examples/language/project/checks.mettle --jobs 1
+```
 
 ```text
 service-checks/

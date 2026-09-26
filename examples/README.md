@@ -4,7 +4,8 @@ Run these commands from the repository root after installing the `mettle` CLI.
 Use `mettle check <file>` to validate a file without running it. In VS Code,
 open any `.mettle` file to use its flow/test play buttons.
 
-File-level batches are sequential by default. When their entries are
+File-level batches are sequential by default unless `mettle.toml` sets a job
+count. When their entries are
 independent, add `--jobs N` to run a bounded number concurrently:
 
 ```bash
@@ -38,6 +39,15 @@ public JSONPlaceholder API:
 
 ```bash
 mettle run examples/language/project/main.mettle --profile qa
+```
+
+The same project's [network-free checks](language/project/checks.mettle)
+demonstrate `[run].jobs` and `[test].jobs` defaults from its manifest:
+
+```bash
+mettle run examples/language/project/checks.mettle --all
+mettle test examples/language/project/checks.mettle
+mettle test examples/language/project/checks.mettle --jobs 1
 ```
 
 The profile and project `.env` files contain only public demonstration values;

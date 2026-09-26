@@ -1,0 +1,18 @@
+// The nearest mettle.toml configures two jobs for each file-level batch.
+//   mettle run examples/language/project/checks.mettle --all
+//   mettle test examples/language/project/checks.mettle
+// Override the project default for one invocation:
+//   mettle test examples/language/project/checks.mettle --jobs 1
+// These checks use the project's .env and require no network access.
+namespace checks
+
+flow selectedProfile = env("PROFILE_NAME")
+flow endpoint = env("API_URL")
+
+test "profile is configured" {
+    assert(selectedProfile() != "")
+}
+
+test "api url is configured" {
+    assert(endpoint() != "")
+}

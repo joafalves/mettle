@@ -62,9 +62,12 @@ flow inspectRequest(baseUrl, requestId) =
 
 The extension asks for `baseUrl` and `requestId` before launching `inspectRequest`. Use `https://jsonplaceholder.typicode.com` as the base URL for the included demo. Anonymous flows are selected by their compiler-reported identity; named flows are selected by name. Dirty files are saved before execution. The dedicated task terminal shows the same structured flow report and live workload dashboard as the CLI. Use `mettle run --verbose` to expand HTTP response headers and decoded bodies.
 
-To run every zero-argument flow in the active file, use **Mettle: Run All Eligible Flows in File** from the Command Palette or the editor title bar. Parameterized flows are skipped; all eligible flows run sequentially and the terminal ends with a batch summary.
+To run every zero-argument flow in the active file, use **Mettle: Run All Eligible Flows in File** from the Command Palette or the editor title bar. Parameterized flows are skipped; the terminal ends with a batch summary. Project batches use `[run].jobs` from the nearest `mettle.toml`, defaulting to one job when omitted.
 
 To run tests declared in the active file, use **Mettle: Run Tests in File**.
+This action honors `[test].jobs` in `mettle.toml`; selecting an individual test
+still runs only that test. For example, `[test]` followed by `jobs = 4` enables
+up to four concurrent tests in the file without extra editor configuration.
 With a `.mettle` file open, click **Mettle profile: Default** (or the current
 profile name) in the bottom status bar, click the gear icon in the editor title
 bar, or run **Mettle: Select Profile** from the Command Palette to choose

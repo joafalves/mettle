@@ -153,6 +153,18 @@ def main() -> None:
         environment=example_environment,
     )
     example_environment["API_TOKEN"] = "safe-demo-token"
+    for command, arguments in (("run", ["--all"]), ("test", [])):
+        configured_jobs = run(
+            command,
+            "examples/language/project/checks.mettle",
+            *arguments,
+            "--output",
+            "json",
+            environment=example_environment,
+        )
+        configured_records = [json.loads(line) for line in configured_jobs.stdout.splitlines()]
+        assert configured_records[0]["jobs"] == 2, configured_records
+        assert configured_records[-1]["passed"] == 2, configured_records
     run("run", "examples/language/secrets.mettle", "--raw", environment=example_environment)
     run("test", "examples/language/secrets.mettle", "--quiet", environment=example_environment)
 
