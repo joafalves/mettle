@@ -10,9 +10,29 @@ use super::{
     WorkloadOperation, WorkloadPhase, WorkloadPolicy, cooperative_yield, evaluate_binary,
     format_duration, process_environment,
 };
+use mettle_capability::{ByteReader, CapabilityError, ValueReader};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[path = "codec.rs"]
+mod codec;
 #[path = "producer.rs"]
 mod producer;
+
+enum StreamReader {
+    Bytes(Box<dyn ByteReader>),
+    Values(Box<dyn ValueReader>),
+}
+
+impl StreamReader {
+    async fn next(&mut self) -> Result<Option<Value>, CapabilityError> {
+        match self {
+            Self::Bytes(reader) => reader
+                .next_chunk()
+                .await
+                .map(|chunk| chunk.map(Value::Bytes)),
+            Self::Values(reader) => reader.next_value().await,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Runtime {
@@ -114,6 +134,15 @@ impl Runtime {
             )
         });
         let _guard = ExecutionIoGuard(io.clone());
+        codec::install(self, plan, &io).map_err(|error| RuntimeError {
+            message: error.message,
+            span: error.span,
+            flow_stack: Vec::new(),
+            scope_path: Vec::new().into_boxed_slice(),
+            assertions: Vec::new(),
+            assertion_only: false,
+            terminal: false,
+        })?;
         let mut result = Executor {
             runtime: self,
             producer: None,
@@ -211,7 +240,7 @@ impl Drop for ExecutionIoGuard {
 #[derive(Clone)]
 struct Executor<'a> {
     runtime: &'a Runtime,
-    producer: Option<Arc<producer::Output>>,
+    producer: Option<producer::Emitter>,
     breaking: bool,
     plan: &'a ExecutionPlan,
     capabilities: &'a [Arc<dyn Capability>],
@@ -613,10 +642,63 @@ impl Executor<'_> {
     ) -> Pin<Box<dyn Future<Output = Result<Value, RuntimeError>> + Send + 'b>> {
         Box::pin(async move {
             match &expression.kind {
+                PlanExpressionKind::CodecCall {
+                    media_type,
+                    encode,
+                    argument,
+                    ..
+                } => {
+                    let input = self.evaluate(argument, locals, context).await?;
+                    if !encode && !matches!(input.revealed(), Value::Bytes(_)) {
+                        return Err(
+                            self.error("codec decode expects complete bytes", argument.span)
+                        );
+                    }
+                    let media = mettle_capability::media_type::MediaType::parse(
+                        media_type,
+                        expression.span,
+                    )
+                    .map_err(|error| self.error(error.message, error.span))?;
+                    let codec = self
+                        .io
+                        .content_codec(expression.span.source, &media)
+                        .ok_or_else(|| {
+                            self.error("codec is not registered for this file", expression.span)
+                        })?;
+                    let result = if *encode {
+                        codec
+                            .encode(input, 10 * 1024 * 1024, expression.span, self.io)
+                            .await
+                    } else {
+                        codec
+                            .decode(input, 10 * 1024 * 1024, expression.span, self.io)
+                            .await
+                    };
+                    result.map_err(|error| self.error(error.message, error.span))
+                }
                 PlanExpressionKind::Source {
                     instructions,
                     local_count,
                 } => Ok(producer::create(
+                    self.runtime.clone(),
+                    self.plan.clone(),
+                    instructions.clone(),
+                    *local_count,
+                    locals.to_vec(),
+                    context.clone(),
+                    self.io,
+                    self.flow_stack.clone(),
+                    self.scope_path.clone(),
+                    self.secrets.clone(),
+                    self.inside_workload,
+                    self.workload_id,
+                    self.next_scope_id.clone(),
+                    expression.span,
+                )),
+                PlanExpressionKind::ValueStream {
+                    instructions,
+                    local_count,
+                } => Ok(producer::create_values(
                     self.runtime.clone(),
                     self.plan.clone(),
                     instructions.clone(),
@@ -740,6 +822,9 @@ impl Executor<'_> {
                         Value::Array(items) => {
                             let mut results = Vec::new();
                             for (index, item) in items.iter().enumerate() {
+                                if index.is_multiple_of(64) {
+                                    tokio::task::yield_now().await;
+                                }
                                 let mut iteration_locals = locals.to_vec();
                                 iteration_locals.resize(*local_count, None);
                                 if let Some(slot) = key_slot {
@@ -788,7 +873,10 @@ impl Executor<'_> {
                         }
                         Value::Object(items) => {
                             let mut results = Object::new();
-                            for (name, item) in items {
+                            for (index, (name, item)) in items.iter().enumerate() {
+                                if index.is_multiple_of(64) {
+                                    tokio::task::yield_now().await;
+                                }
                                 let mut iteration_locals = locals.to_vec();
                                 iteration_locals.resize(*local_count, None);
                                 if let Some(slot) = key_slot {
@@ -836,7 +924,66 @@ impl Executor<'_> {
                                 Ok(Value::Null)
                             }
                         }
-                        _ => Err(self.error("`for` requires an array or object", expression.span)),
+                        Value::Source(_) | Value::Stream(_) => {
+                            if *produces_value {
+                                return Err(self.error(
+                                    "a source loop cannot collect results; write its effects inside the loop",
+                                    expression.span,
+                                ));
+                            }
+                            let mut reader =
+                                match source.revealed() {
+                                    Value::Source(source) => {
+                                        StreamReader::Bytes(source.open(self.io).await.map_err(
+                                            |error| self.error(error.message, error.span),
+                                        )?)
+                                    }
+                                    Value::Stream(source) => {
+                                        StreamReader::Values(source.open(self.io).await.map_err(
+                                            |error| self.error(error.message, error.span),
+                                        )?)
+                                    }
+                                    _ => unreachable!(),
+                                };
+                            let mut index = 0_i64;
+                            while let Some(item) = reader
+                                .next()
+                                .await
+                                .map_err(|error| self.error(error.message, error.span))?
+                            {
+                                let mut iteration_locals = locals.to_vec();
+                                iteration_locals.resize(*local_count, None);
+                                if let Some(slot) = key_slot {
+                                    iteration_locals[*slot] = Some(Value::Integer(index));
+                                }
+                                iteration_locals[*value_slot] =
+                                    Some(if sensitive { item.sensitive() } else { item });
+                                let mut assertions = Vec::new();
+                                self.run_instructions(
+                                    instructions,
+                                    &mut iteration_locals,
+                                    context,
+                                    &mut assertions,
+                                    self.collect_test_expressions,
+                                )
+                                .await?;
+                                if self.breaking {
+                                    self.breaking = false;
+                                    break;
+                                }
+                                index = index.checked_add(1).ok_or_else(|| {
+                                    self.error(
+                                        "source index exceeds integer range",
+                                        expression.span,
+                                    )
+                                })?;
+                            }
+                            Ok(Value::Null)
+                        }
+                        _ => Err(self.error(
+                            "`for` requires an array, object, or source",
+                            expression.span,
+                        )),
                     }
                 }
                 PlanExpressionKind::Member { value, member } => {

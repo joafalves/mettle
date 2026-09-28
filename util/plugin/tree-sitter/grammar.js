@@ -31,7 +31,7 @@ const definition = {
   ],
   reserved: {
     global: _ => [
-      "flow", "test", "context", "namespace", "defaults", "use", "return", "assert",
+      "flow", "test", "context", "codec", "namespace", "defaults", "use", "return", "assert",
       "if", "else", "and", "or", "not", "within", "retry", "parallel", "rate",
       "concurrency", "true", "false", "null", "for", "in", "fail",
       "is", "as", "yield", "break",
@@ -41,6 +41,7 @@ const definition = {
   rules: {
     source_file: $ => repeat(choice(
       $.namespace_declaration, $.namespace_use, $.context_declaration,
+      $.codec_declaration, $.codec_use,
       $.file_context_use, $.flow_declaration, $.anonymous_flow,
       $.test_declaration, $.call_expression,
     )),
@@ -52,6 +53,12 @@ const definition = {
     ))),
     context_body: $ => block($, choice($.context_use, $.defaults_declaration, $.object_field), true),
     context_use: $ => seq("use", "context", field("name", $.identifier)),
+    codec_use: $ => seq("use", "codec", field("name", $.identifier)),
+    codec_declaration: $ => seq("codec", field("name", $.identifier), $.codec_body),
+    codec_body: $ => block($, choice($.codec_media_type, $.codec_aliases, $.codec_method), true),
+    codec_media_type: $ => seq(field("name", alias("mediaType", $.identifier)), ":", field("value", $.string)),
+    codec_aliases: $ => seq(field("name", alias("aliases", $.identifier)), ":", "[", commaSepTrailing($.string), "]"),
+    codec_method: $ => seq(field("name", choice("encode", "decode")), "(", field("parameter", $.identifier), ")", field("body", $.block)),
     defaults_declaration: $ => seq("defaults", field("capability", $.identifier), $.object),
     flow_declaration: $ => seq("flow", field("name", $.identifier), optional($.parameter_list),
       choice(seq("=", field("body", $._expression)), field("body", $.block))),
@@ -94,7 +101,7 @@ const definition = {
       $.member_expression, $.index_expression,
       $.type_operation,
       $.within_expression, $.retry_expression, $.parallel_expression,
-      $.rate_expression, $.concurrency_expression, $.for_expression, $.fail_expression, $.source_expression,
+      $.rate_expression, $.concurrency_expression, $.for_expression, $.fail_expression, $.source_expression, $.stream_expression,
     ),
     parenthesized_expression: $ => seq("(", $._expression, ")"),
     type_operation: $ => prec.left(PREC.kind, seq(
@@ -140,12 +147,13 @@ const definition = {
     named_branch: $ => seq(field("name", $.identifier), ":", field("value", $._expression)),
     fail_expression: $ => seq("fail", "(", $._expression, ")"),
     source_expression: $ => prec(1, seq("source", $.block)),
+    stream_expression: $ => prec(1, seq("stream", $.block)),
     for_expression: $ => seq("for", optional(seq(field("key", $.identifier), ",")),
       field("value", $.identifier), "in", field("iterable", $._iterable_expression),
       field("body", $.block)),
 
     // Contextual producer keyword: retain existing variables/fields named source.
-    identifier: $ => choice($._identifier_word, "source"),
+    identifier: $ => choice($._identifier_word, "source", "stream"),
     _identifier_word: _ => /[A-Za-z_][A-Za-z0-9_]*/,
     integer: _ => /-?(0[xX][0-9a-fA-F](_?[0-9a-fA-F])*|0[bB][01](_?[01])*|[0-9](_?[0-9])*)/,
     float: _ => /-?[0-9](_?[0-9])*(\.[0-9](_?[0-9])*([eE][+-]?[0-9](_?[0-9])*)?|[eE][+-]?[0-9](_?[0-9])*)/,
@@ -177,7 +185,7 @@ const iterableRules = new Set([
   "concurrency_expression", "timeout_option", "attempts_option", "delay_option", "limit_option",
   "target_option", "period_option", "duration_option", "expression_body", "parallel_body",
   "named_branch", "fail_expression", "for_expression", "block", "_statement", "binding",
-  "return_statement", "assert_statement", "if_statement", "expression_statement", "source_expression", "yield_statement", "break_statement",
+  "return_statement", "assert_statement", "if_statement", "expression_statement", "source_expression", "stream_expression", "yield_statement", "break_statement",
 ]);
 const iterableName = name => `_iterable_${name.replace(/^_/, "")}`;
 function inIterable(rule, $) {

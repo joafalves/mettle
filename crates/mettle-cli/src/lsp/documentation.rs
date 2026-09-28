@@ -4,11 +4,11 @@ use std::fmt::Write as _;
 
 use mettle_capability::documentation::{field_reference, operation_hover, reference, signature};
 use mettle_capability::{CapabilityDescriptor, FieldSchema, OperationSchema, SchemaType};
-use mettle_compiler::{find_definition, resolve_documentation_flow};
+use mettle_compiler::{find_definition, resolve_documentation_codec, resolve_documentation_flow};
 use mettle_syntax::documentation::{
     CallSite, Documentation, call_site, declaration, recover, symbol,
 };
-use mettle_syntax::{MettleDecl, Program, Span};
+use mettle_syntax::{CodecDecl, MettleDecl, Program, Span};
 use serde_json::{Value, json};
 
 use super::{Server, byte_offset, file_uri_to_path, normalize_path, span_range};
@@ -226,17 +226,20 @@ impl Server {
 
 fn hover(snapshot: &Snapshot) -> Option<(String, Span, Option<String>)> {
     let text = &snapshot.sources[snapshot.source].text;
-    if let Some((name, span)) = mettle_syntax::language::at(text, snapshot.byte) {
-        let content = core_item(name)
-            .map(|item| item.hover())
-            .or_else(|| mettle_syntax::language::reference(name))?;
-        return Some((content, span, Some(uri(&format!("language.{name}")))));
+    if let Some(content) = language_hover(text, snapshot.byte) {
+        return Some(content);
     }
     let (name, range) = symbol(text, snapshot.byte)?;
     let definition = find_definition(&snapshot.program, snapshot.source, snapshot.byte);
+    if let Some(content) = codec_hover(snapshot, definition, &name, range) {
+        return Some(content);
+    }
     // Locals/context bindings shadow constants, just as in compilation. Operation
     // call targets are always capability-qualified, regardless of such bindings.
     let is_call = mettle_syntax::documentation::is_call_target(text, range);
+    if is_call && let Some(content) = codec_method_hover(snapshot, &name, range) {
+        return Some(content);
+    }
     let sources = snapshot
         .sources
         .iter()
@@ -250,17 +253,10 @@ fn hover(snapshot: &Snapshot) -> Option<(String, Span, Option<String>)> {
     if is_call && let Some(item) = mettle_compiler::documentation::item(&name) {
         return Some((item.hover(), range, Some(uri(&format!("language.{name}")))));
     }
-    if (definition.is_none() && semantic.is_none()) || is_call {
-        if let Some((capability, operation)) = operation(&name) {
-            return Some((
-                operation_hover(capability, operation),
-                range,
-                Some(uri(&name)),
-            ));
-        }
-        if let Some(content) = reference(CAPABILITIES, &name) {
-            return Some((content, range, Some(uri(&name))));
-        }
+    if ((definition.is_none() && semantic.is_none()) || is_call)
+        && let Some(content) = capability_hover(&name, range)
+    {
+        return Some(content);
     }
     // Field documentation belongs to the innermost operation, including nested
     // schema fields such as tls.verifyCertificates, never arbitrary body keys.
@@ -329,6 +325,118 @@ fn hover(snapshot: &Snapshot) -> Option<(String, Span, Option<String>)> {
         return Some((content, info.span, info.value.operation.as_deref().map(uri)));
     }
     definition.and_then(|target| declaration_hover(snapshot, target, &name, range))
+}
+
+fn capability_hover(name: &str, range: Span) -> Option<(String, Span, Option<String>)> {
+    let content = if let Some((capability, operation)) = operation(name) {
+        operation_hover(capability, operation)
+    } else {
+        reference(CAPABILITIES, name)?
+    };
+    Some((content, range, Some(uri(name))))
+}
+
+fn language_hover(text: &str, byte: usize) -> Option<(String, Span, Option<String>)> {
+    let (name, span) = mettle_syntax::language::at(text, byte)?;
+    let content = core_item(name)
+        .map(|item| item.hover())
+        .or_else(|| mettle_syntax::language::reference(name))?;
+    Some((content, span, Some(uri(&format!("language.{name}")))))
+}
+
+fn codec_hover(
+    snapshot: &Snapshot,
+    definition: Option<Span>,
+    _name: &str,
+    range: Span,
+) -> Option<(String, Span, Option<String>)> {
+    let codec = snapshot
+        .program
+        .codecs
+        .iter()
+        .find(|codec| Some(codec.name.span) == definition)?;
+    let docs = declaration(
+        &snapshot.sources[codec.span.source].text,
+        codec.span.start,
+        &[],
+    );
+    let qualified = if codec.namespace.is_empty() {
+        codec.name.value.clone()
+    } else {
+        format!("{}.{}", codec.namespace, codec.name.value)
+    };
+    let decode_shape = if codec.is_incremental(&snapshot.program) {
+        "Its decoder turns an owned byte source into a lazy stream of bounded native records; buffered/direct calls collect a bounded array."
+    } else {
+        "Its decoder turns complete bytes into one native value."
+    };
+    let mut markdown = format!(
+        "```mettle\ncodec {qualified}\n{qualified}.mediaType: string\n```\n\nContent codec for `{}`. It is active only in files with `use codec {}`. Its encoder returns bytes. {decode_shape} Conversion bodies cannot perform I/O.",
+        codec.media_type.value, codec.name.value
+    );
+    if !codec.aliases.is_empty() {
+        let aliases = codec
+            .aliases
+            .iter()
+            .map(|alias| format!("`{}`", alias.value))
+            .collect::<Vec<_>>()
+            .join(", ");
+        markdown.push_str("\n\nAliases: ");
+        markdown.push_str(&aliases);
+        markdown.push('.');
+    }
+    if !docs.description.is_empty() {
+        markdown.push_str("\n\n");
+        markdown.push_str(&docs.description);
+    }
+    Some((markdown, range, None))
+}
+
+fn codec_method_hover(
+    snapshot: &Snapshot,
+    name: &str,
+    range: Span,
+) -> Option<(String, Span, Option<String>)> {
+    let (codec, encode) = codec_method(snapshot, name)?;
+    let incremental = codec.is_incremental(&snapshot.program);
+    let argument = if encode { "value" } else { "bytes" };
+    let result = if encode {
+        "bytes"
+    } else if incremental {
+        "array"
+    } else {
+        "native value"
+    };
+    let explanation = if encode {
+        "Convert one complete native value to representation bytes. The implementation must return bytes."
+    } else if incremental {
+        "Decode complete bytes by collecting the codec's lazy native records into a bounded array. Streamed HTTP responses instead consume those records one at a time."
+    } else {
+        "Convert one complete representation byte value into an ordinary native value."
+    };
+    let markdown = format!(
+        "```mettle\n{}.{method}({argument}) -> {result}\n```\n\n{explanation} Requires `use codec {}` in this file; input and output are bounded to 10 MiB, with a 30-second conversion deadline.",
+        codec.name.value,
+        codec.name.value,
+        method = if encode { "encode" } else { "decode" }
+    );
+    Some((markdown, range, None))
+}
+
+fn codec_method<'a>(snapshot: &'a Snapshot, name: &str) -> Option<(&'a CodecDecl, bool)> {
+    let (codec_name, method) = name.rsplit_once('.')?;
+    let encode = match method {
+        "encode" => true,
+        "decode" => false,
+        _ => return None,
+    };
+    let id = resolve_documentation_codec(
+        &snapshot.program,
+        codec_name,
+        &snapshot.namespace,
+        &snapshot.namespace_uses,
+    )?;
+    Some((&snapshot.program.codecs[id], encode))
 }
 
 fn local_hover(
@@ -401,6 +509,29 @@ fn declaration_hover(
     name: &str,
     range: Span,
 ) -> Option<(String, Span, Option<String>)> {
+    for codec in &snapshot.program.codecs {
+        for (flow_id, encode) in [(codec.encode_flow, true), (codec.decode_flow, false)] {
+            let method = &snapshot.program.flows[flow_id];
+            if method.name.as_ref().is_some_and(|name| name.span == target) {
+                let verb = if encode { "encode" } else { "decode" };
+                let explanation = if encode {
+                    "Return bounded representation bytes from one native value."
+                } else if codec.is_incremental(&snapshot.program) {
+                    "Return `stream { ... yield value ... }` from an owned byte source; streamed responses consume records lazily."
+                } else {
+                    "Return a bounded native value from complete representation bytes."
+                };
+                return Some((
+                    format!(
+                        "**codec {}.{verb}**\n\n{explanation} Requires `use codec {}` in this file.",
+                        codec.name.value, codec.name.value
+                    ),
+                    range,
+                    None,
+                ));
+            }
+        }
+    }
     for flow in &snapshot.program.flows {
         let doc = doc_for_flow(snapshot, flow);
         if flow.name.as_ref().is_some_and(|name| name.span == target) {
@@ -461,6 +592,36 @@ fn signature_help(snapshot: &Snapshot) -> Option<Value> {
             operation.documentation.summary.to_owned(),
             names,
             parameters,
+        )
+    } else if let Some((codec, encode)) = codec_method(snapshot, &call.name) {
+        let name = codec.name.value.clone();
+        let method = if encode { "encode" } else { "decode" };
+        let argument = if encode { "value" } else { "bytes" };
+        let incremental = codec.is_incremental(&snapshot.program);
+        let description = if encode {
+            "Complete native value to convert into bytes; output is limited to 10 MiB."
+        } else if incremental {
+            "Complete representation bytes to decode into a bounded array of native records."
+        } else {
+            "Complete representation bytes to decode; output is limited to 10 MiB."
+        };
+        (
+            format!(
+                "{name}.{method}({argument}: {}) -> {}",
+                if encode { "value" } else { "bytes" },
+                if encode {
+                    "bytes"
+                } else if incremental {
+                    "array"
+                } else {
+                    "native value"
+                }
+            ),
+            format!("Custom content codec `{name}`; requires `use codec {name}` in this file."),
+            vec![argument.to_owned()],
+            vec![
+                json!({"label": format!("{argument}: {}", if encode { "value" } else { "bytes" }), "documentation": {"kind": "markdown", "value": description}}),
+            ],
         )
     } else if let Some(item) = core_item(&call.name).filter(|item| !item.parameters.is_empty()) {
         let names = item
@@ -552,6 +713,37 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.directory).unwrap();
         }
+    }
+
+    #[test]
+    fn custom_codec_hovers_and_registration_use_source_metadata() {
+        let text = "/// Encode a temperature as decimal text.\ncodec temperature {\n mediaType: \"application/vnd.example.temperature\"\n aliases: [\"application/x-temperature\"]\n encode(value) { text.encode(value as string) }\n decode(bytes) { text.decode(bytes) as number }\n}\nuse codec temperature\nflow main = temperature.mediaType\nflow encoded = temperature.encode(23)";
+        let fixture = Fixture::new(text);
+        for needle in ["temperature\nflow main", "temperature.mediaType"] {
+            let hover = fixture.query("textDocument/hover", needle);
+            let markdown = hover["contents"]["value"].as_str().unwrap();
+            assert!(
+                markdown.contains("application/vnd.example.temperature"),
+                "{markdown}"
+            );
+            assert!(markdown.contains("application/x-temperature"), "{markdown}");
+            assert!(markdown.contains("use codec"), "{markdown}");
+            assert!(markdown.contains("Encode a temperature"), "{markdown}");
+        }
+        let method = fixture.query("textDocument/hover", "temperature.encode(23)");
+        assert!(
+            method["contents"]["value"]
+                .as_str()
+                .unwrap()
+                .contains("representation bytes")
+        );
+        let signature = fixture.query("textDocument/signatureHelp", "23)");
+        assert!(
+            signature["signatures"][0]["parameters"][0]["documentation"]["value"]
+                .as_str()
+                .unwrap()
+                .contains("Complete native value")
+        );
     }
 
     #[test]

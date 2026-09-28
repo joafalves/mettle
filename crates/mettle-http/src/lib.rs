@@ -26,6 +26,7 @@ mod outgoing;
 mod request_body;
 mod response_stream;
 mod schema;
+mod sse;
 #[cfg(test)]
 mod streaming_tests;
 use request_body::{RequestBody, UploadControl, UploadGuard};
@@ -173,7 +174,7 @@ impl HttpCapability {
                 span,
             ));
         }
-        let prepared = outgoing::prepare(&options, span)?;
+        let prepared = outgoing::prepare(&options, span, context).await?;
         // A server may echo or transform a sensitive request payload. Keep that
         // content protected in both complete and deferred response views.
         let payload_sensitive = options
@@ -332,7 +333,9 @@ impl HttpCapability {
                 has_no_body,
                 max_response_bytes,
                 span,
-            )?;
+                context,
+            )
+            .await?;
 
             Ok(schema::ResponseValue {
                 body: decoded,

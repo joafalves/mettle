@@ -39,6 +39,26 @@ pub fn resolve_documentation_flow(
     }
 }
 
+/// Resolve a custom codec with the same namespace rules as compiler registration.
+#[must_use]
+pub fn resolve_documentation_codec(
+    program: &Program,
+    name: &str,
+    namespace: &str,
+    uses: &[mettle_syntax::Spanned<String>],
+) -> Option<usize> {
+    let ids = program
+        .codecs
+        .iter()
+        .enumerate()
+        .map(|(id, codec)| (qualified_name(&codec.namespace, &codec.name.value), id))
+        .collect();
+    match resolve_visible_name(&ids, name, namespace, uses) {
+        NameResolution::Found(id) => Some(id),
+        _ => None,
+    }
+}
+
 /// Find the declaration behind a flow call or local binding reference.
 #[must_use]
 pub fn find_implementation(program: &Program, source: usize, byte: usize) -> Option<Span> {
@@ -63,6 +83,7 @@ struct DefinitionFinder<'a> {
     byte: usize,
     context_ids: HashMap<String, usize>,
     flow_ids: HashMap<String, usize>,
+    codec_ids: HashMap<String, usize>,
 }
 
 impl<'a> DefinitionFinder<'a> {
@@ -89,16 +110,40 @@ impl<'a> DefinitionFinder<'a> {
                     .map(|name| (qualified_name(&flow.namespace, &name.value), id))
             })
             .collect();
+        let codec_ids = program
+            .codecs
+            .iter()
+            .enumerate()
+            .map(|(id, codec)| (qualified_name(&codec.namespace, &codec.name.value), id))
+            .collect();
         Self {
             program,
             source,
             byte,
             context_ids,
             flow_ids,
+            codec_ids,
         }
     }
 
     fn find(&self) -> Option<Span> {
+        for codec in &self.program.codecs {
+            if self.at(codec.name.span) || self.at(codec.media_type.span) {
+                return Some(codec.name.span);
+            }
+        }
+        for registration in &self.program.codec_uses {
+            if self.at(registration.name.span)
+                && let NameResolution::Found(id) = resolve_visible_name(
+                    &self.codec_ids,
+                    &registration.name.value,
+                    &registration.namespace,
+                    &registration.namespace_uses,
+                )
+            {
+                return Some(self.program.codecs[id].name.span);
+            }
+        }
         for context in &self.program.contexts {
             if let Some(name) = &context.name
                 && self.at(name.span)
@@ -269,7 +314,18 @@ impl<'a> DefinitionFinder<'a> {
             ExpressionKind::Name(name) => {
                 if self.at(expression.span) {
                     let root = name.split('.').next().unwrap_or(name);
-                    return locals.get(root).copied();
+                    if let Some(local) = locals.get(root) {
+                        return Some(*local);
+                    }
+                    if let Some(codec_name) = name.strip_suffix(".mediaType") {
+                        let namespace = flow.map_or("", |flow| flow.namespace.as_str());
+                        let uses = flow.map_or(&[][..], |flow| flow.namespace_uses.as_slice());
+                        if let NameResolution::Found(id) =
+                            resolve_visible_name(&self.codec_ids, codec_name, namespace, uses)
+                        {
+                            return Some(self.program.codecs[id].name.span);
+                        }
+                    }
                 }
             }
             ExpressionKind::Array(values) => {
@@ -286,7 +342,9 @@ impl<'a> DefinitionFinder<'a> {
                     }
                 }
             }
-            ExpressionKind::Block(statements) | ExpressionKind::Source(statements) => {
+            ExpressionKind::Block(statements)
+            | ExpressionKind::Source(statements)
+            | ExpressionKind::ValueStream(statements) => {
                 if let Some(flow) = flow {
                     return self.find_in_statements(statements, &mut locals.clone(), flow);
                 }
@@ -315,6 +373,28 @@ impl<'a> DefinitionFinder<'a> {
                 named_arguments,
                 options,
             } => {
+                if self.at(callee.span)
+                    && let Some((codec_name, method)) = callee.value.rsplit_once('.')
+                    && matches!(method, "encode" | "decode")
+                    && let Some(flow) = flow
+                    && let Some(id) = resolve_documentation_codec(
+                        self.program,
+                        codec_name,
+                        &flow.namespace,
+                        &flow.namespace_uses,
+                    )
+                {
+                    let codec = &self.program.codecs[id];
+                    let method_flow = if method == "encode" {
+                        codec.encode_flow
+                    } else {
+                        codec.decode_flow
+                    };
+                    return self.program.flows[method_flow]
+                        .name
+                        .as_ref()
+                        .map(|name| name.span);
+                }
                 if self.at(callee.span)
                     && !callee.value.contains('.')
                     && !matches!(callee.value.as_str(), "env" | "senv" | "secret" | "echo")

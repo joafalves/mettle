@@ -60,8 +60,9 @@ macro_rules! keywords {
 }
 
 keywords! {
+    Codec => ("codec", "codec name {\n  mediaType: string\n  encode(value) { ... }\n  decode(input) { ... }\n}", "Define a content processor, activated by file-level `use codec name`. Encode receives a native value and returns bytes. Decode either receives complete bytes and returns one native value, or receives a byte source and returns `stream { ... yield value ... }` for incremental records. Streamed HTTP response bodies use the latter lazily; buffered responses and direct decode calls collect its values into a bounded array. Conversion bodies cannot perform HTTP/filesystem I/O or start execution policies. Decode is the only decoder method; there are no chunk or EOF callbacks.", "codec records {\n mediaType: \"application/x-records\"\n encode(value) { text.encode(value as string) }\n decode(input) { stream { for line in text.lines(input) { yield line } } }\n}\nuse codec records", &[]),
     Break => ("break", "break", "Exit the nearest collection loop. A value-producing loop returns only completed iterations. It does not exit the flow or an enclosing source producer; producer completion still ends its body normally. Cannot cross execution-policy or source boundaries.", "flow main { for value in [1, 2] { if (value == 2) { break } }\n 42 }", &[]),
-    Yield => ("yield", "yield content", "Supply UTF-8 string or byte content from a lazy source producer under backpressure. Production pauses until the consumer asks for more. A piece is not a packet, flush, or remote acceptance. Only valid inside its source block; aliases cannot duplicate consumption.", "flow main { content = source { yield \"Hello\" }\n 42 }", &[("content", "String encoded as UTF-8 or bytes transmitted unchanged; other kinds fail.")]),
+    Yield => ("yield", "yield value", "Produce the next item on demand. Inside `source`, the item must be a UTF-8 string or bytes. Inside `stream`, it is one bounded complete native value. Yield waits for the consumer; it is not a network packet, flush, or remote acknowledgement.", "flow main { content = source { yield \"Hello\" }\n 42 }", &[("value", "String or bytes in a byte source; one complete native value in a value stream.")]),
     Source => ("source", "source { ... yield content ... }", "Create an execution-owned, single-consumer byte source without running its body. Capture bindings at construction, then produce on demand. Normal completion ends the source; dropping its consumer stops production. It cannot escape as an execution result. Producers are bounded to 1 GiB and 30 seconds from consumption, and their content is conservatively sensitive. Contextual keyword: existing variables/fields named source remain valid. Also names the primitive source kind in is/as operations.", "flow main { content = source { yield \"Hello\" }\n content is source }", &[]),
     If => ("if", "if (condition) { ... } else { ... }", "Execute only the selected statement branch. The condition must be boolean, and branch bindings stay local. Use return in branches for an early flow result; if is not a value expression.", "flow main { if (true) { return 1 } else { return 2 } }", &[]),
     For => ("for", "for value in collection { ... }", "Iterate an array or object sequentially. A value-producing loop maps into a collection of the same shape; a statement loop need not collect a result. Use two bindings (`for key, value in ...`) to access the array index or object key. This does not create parallel work or consume byte sources.", "flow main = for value in [1, 2] { value }", &[]),
@@ -77,7 +78,7 @@ keywords! {
     Context => ("context", "context name { ... } / use context name", "Declare reusable values and capability defaults. A declaration alone does not apply the context: use `use context name`, or combine declaration and application with `use context name { ... }`. Anonymous `use context { ... }` also works. File-level uses apply to every flow/test in that file, even when written later.", "context settings { greeting: \"Hello\" }\nuse context settings\nflow main = greeting", &[]),
     Namespace => ("namespace", "namespace name / use namespace name", "Assign the file's declarations to a namespace, or make another namespace visible with `use namespace`. This changes name resolution, not file loading; projects discover source files through their manifest rules. Ambiguous unqualified names are rejected.", "namespace demo\nflow main = 42", &[]),
     Defaults => ("defaults", "defaults capability { option: value }", "Set supported capability defaults inside a context, such as HTTP baseUrl or timeout. Apply that context to use them; explicit call options override the defaults. The compiler validates default names and types against the capability descriptor.", "use context { defaults http { baseUrl: \"http://127.0.0.1:8080\" } }\nflow main = 42", &[]),
-    Use => ("use", "use context name / use namespace name", "Apply a context's values/defaults or make namespace declarations visible. At file level, `use context` applies to all flows and tests in that file regardless of its position; inside a flow it applies to that flow. Named declaration-and-use and anonymous context blocks are supported. `use namespace` affects name lookup, not environment-file selection or file imports.", "use context credentials { token: \"demo-token\" }\nflow main = token", &[]),
+    Use => ("use", "use context name / use namespace name / use codec name", "Apply a context's values/defaults, make namespace declarations visible, or register a codec for calls written in this file. File-level uses apply regardless of declaration order. Codec registration is explicit: a declaration alone exposes its mediaType but cannot silently change decoding. Project files may use a codec declared in another source file.", "codec temperature {\n mediaType: \"application/vnd.example.temperature\"\n encode(value) { text.encode(value as string) }\n decode(bytes) { text.decode(bytes) as number }\n}\nuse codec temperature\nflow main = temperature.mediaType", &[]),
     Return => ("return", "return expression", "Finish the current flow with an explicit value, skipping remaining statements. Most flows can simply end with their result expression. Return is not allowed in tests and cannot let a live source escape as a final execution result.", "flow main { return 42 }", &[]),
     Assert => ("assert", "assert(condition, message?)", "Check a boolean condition. In a flow, false fails the execution; at test level, it records an assertion failure and later checks continue. Inside an execution block such as retry, false fails the block. The optional message must be a string literal and may interpolate values; it is evaluated only on failure and sensitive values are redacted.", "test \"status check\" { assert(200 == 200, \"status should be 200\") }", &[("condition", "Boolean condition to check."), ("message", "Optional string literal explaining failure; interpolation runs only when the check fails.")]),
     Fail => ("fail", "fail(message)", "Stop the current execution with a failure and a string message. It is terminal: retry does not retry it, and owned parallel/load work is cancelled. It is not a process-wide exit; unrelated batch entries may continue. Sensitive message contents are redacted.", "flow main { fail(\"scenario cannot continue\") }", &[("message", "String explaining why this execution must stop.")]),
@@ -93,8 +94,19 @@ keywords! {
 
 #[must_use]
 pub fn item(name: &str) -> Option<&'static Item> {
+    if name == "stream" {
+        return Some(&STREAM);
+    }
     KEYWORDS.iter().find(|item| item.name == name)
 }
+
+static STREAM: Item = Item {
+    name: "stream",
+    form: "stream { ... yield value ... }",
+    description: "Create one execution-owned, single-consumer stream of bounded native values. Its body runs only while consumed; each `yield` waits for the consumer. An incremental codec returns this from `decode(input)`, where input is a byte source. Normal block completion is EOF; dropping the consumer stops production. Unlike a byte `source`, a value stream cannot be used directly as an HTTP request body or filesystem write source.",
+    example: "codec records {\n mediaType: \"application/x-records\"\n encode(value) { text.encode(value as string) }\n decode(input) { stream { for line in text.lines(input) { yield line } } }\n}",
+    parameters: &[],
+};
 
 #[must_use]
 pub fn kind_description(kind: ValueKind) -> &'static str {
@@ -149,6 +161,13 @@ pub fn at(source: &str, byte: usize) -> Option<(&'static str, Span)> {
         .iter()
         .position(|token| token.span.start <= byte && byte < token.span.end)?;
     let token = &tokens[index];
+    if matches!(&token.kind, TokenKind::Identifier(name) if name == "stream")
+        && tokens
+            .get(index + 1)
+            .is_some_and(|next| matches!(next.kind, TokenKind::LeftBrace))
+    {
+        return Some(("stream", token.span));
+    }
     if index > 0 && matches!(tokens[index - 1].kind, TokenKind::Is | TokenKind::As) {
         let kind = ValueKind::parse(source.get(token.span.start..token.span.end)?)?;
         return Some((kind.name(), token.span));

@@ -19,9 +19,12 @@ pub mod content;
 pub mod documentation;
 mod io;
 pub mod media_type;
+mod text_lines;
 pub use io::{
-    ByteReader, ByteSource, CHUNK_BYTES, ChunkFuture, DEFAULT_READ_BYTES, DEFAULT_TRANSFER_BYTES,
-    IoCancellation, IoContext, IoResource, ReaderFuture, SourceFactory,
+    ByteReader, ByteSource, CHUNK_BYTES, ChunkFuture, CodecBinding, ContentCodec,
+    DEFAULT_READ_BYTES, DEFAULT_TRANSFER_BYTES, IoCancellation, IoContext, IoResource,
+    ReaderFuture, SourceFactory, ValueFuture, ValueReader, ValueReaderFuture, ValueSource,
+    ValueSourceFactory,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,6 +38,7 @@ pub enum SchemaType {
     Body,
     Bytes,
     Source,
+    ValueStream,
     Writable,
     Encoded,
     Duration,
@@ -58,6 +62,7 @@ impl SchemaType {
             Self::Body => "HTTP body value",
             Self::Bytes => "bytes",
             Self::Source => "byte source",
+            Self::ValueStream => "value stream",
             Self::Writable => "string, bytes, or byte source",
             Self::Encoded => "complete string or bytes",
             Self::Duration => "duration",
@@ -160,6 +165,7 @@ pub enum Value {
     String(String),
     Bytes(Arc<[u8]>),
     Source(Arc<ByteSource>),
+    Stream(Arc<ValueSource>),
     Deferred(Deferred),
     Duration(Duration),
     Array(Vec<Self>),
@@ -175,6 +181,10 @@ impl Value {
             Self::Source(_) => Self::Object(Object::from([(
                 "type".to_owned(),
                 Self::String("byteSource".to_owned()),
+            )])),
+            Self::Stream(_) => Self::Object(Object::from([(
+                "type".to_owned(),
+                Self::String("valueStream".to_owned()),
             )])),
             Self::Deferred(field) => field.0.snapshot(),
             Self::Array(values) => Self::Array(values.iter().map(Self::snapshot).collect()),
@@ -199,6 +209,7 @@ impl Value {
             Self::String(_) => "string",
             Self::Bytes(_) => "bytes",
             Self::Source(_) => "byte source",
+            Self::Stream(_) => "value stream",
             Self::Deferred(_) => "deferred field",
             Self::Duration(_) => "duration",
             Self::Array(_) => "array",
@@ -249,7 +260,7 @@ impl Value {
     #[must_use]
     pub fn contains_source(&self) -> bool {
         match self.revealed() {
-            Self::Source(_) | Self::Deferred(_) => true,
+            Self::Source(_) | Self::Stream(_) | Self::Deferred(_) => true,
             Self::Array(values) => values.iter().any(Self::contains_source),
             Self::Object(fields) => fields.values().any(Self::contains_source),
             _ => false,
@@ -346,6 +357,7 @@ impl fmt::Display for Value {
                 formatter.write_str("]")
             }
             Self::Source(_) => formatter.write_str("<byte source>"),
+            Self::Stream(_) => formatter.write_str("<value stream>"),
             Self::Deferred(value) => value.0.snapshot().fmt(formatter),
             Self::Duration(value) => write!(formatter, "{}ns", value.as_nanos()),
             Self::Array(values) => {

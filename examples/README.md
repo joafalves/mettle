@@ -79,7 +79,8 @@ mettle run examples/http/streaming.mettle --raw > result.json
 
 `stream: true` exposes raw `response.chunks` for `fs.write` without complete memory
 capture. Normal requests still return complete responses. Source/event iteration
-and SSE decoding are future work; current `for` loops iterate arrays/objects.
+and SSE decoding are demonstrated in [incremental.mettle](http/incremental.mettle).
+Byte and value sources have one consumer; a source loop does not collect results.
 
 [Content representations](http/content.mettle) uses the same local fixture to
 demonstrate optional media types, custom JSON representations, scalar bodies,
@@ -88,6 +89,20 @@ and sending pre-encoded bytes unchanged:
 ```bash
 mettle run examples/http/content.mettle main --arg baseUrl=http://127.0.0.1:8080
 ```
+
+[Custom complete-value codec](http/custom-codec.mettle) declares a numeric-text
+representation, then explicitly registers it with `use codec`. It exercises
+direct encode/decode, automatic request encoding, response decoding, a media-type
+alias, and deferred decoding of a streamed response:
+
+```bash
+mettle run examples/http/custom-codec.mettle
+mettle test examples/http/custom-codec.mettle
+```
+
+Project files can share the declaration but must register it separately in each
+file that makes matching I/O calls. Without registration, generic media-type
+fallbacks apply; the media-type constant alone is not activation.
 
 The fixture startup command is below. No public service or real credential is
 needed. Client `.body` is decoded using Content-Type; `.bodyBytes` retains the

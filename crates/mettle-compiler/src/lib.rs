@@ -20,8 +20,19 @@ use mettle_syntax::{
 pub struct ExecutionPlan {
     pub capability_names: Vec<String>,
     pub contexts: Vec<ContextPlan>,
+    pub codecs: Vec<CodecPlan>,
     pub flows: Vec<MettlePlan>,
     pub default_flow: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CodecPlan {
+    pub source: usize,
+    pub name: String,
+    pub media_types: Vec<String>,
+    pub encode_flow: usize,
+    pub decode_flow: usize,
+    pub incremental: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -106,7 +117,17 @@ pub struct PlanExpression {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlanExpressionKind {
+    CodecCall {
+        media_type: String,
+        flow: usize,
+        encode: bool,
+        argument: Box<PlanExpression>,
+    },
     Source {
+        instructions: Vec<Instruction>,
+        local_count: usize,
+    },
+    ValueStream {
         instructions: Vec<Instruction>,
         local_count: usize,
     },
@@ -216,6 +237,7 @@ pub enum ValueType {
     Boolean,
     Bytes,
     Source,
+    Stream,
     Integer,
     Float,
     String,
@@ -232,6 +254,7 @@ impl ValueType {
             Self::Boolean => "boolean",
             Self::Bytes => "bytes",
             Self::Source => "byte source",
+            Self::Stream => "value stream",
             Self::Integer => "integer",
             Self::Float => "number",
             Self::String => "string",
@@ -256,6 +279,7 @@ const fn schema_value_type(schema: SchemaType) -> ValueType {
         | SchemaType::Encoded => ValueType::Inferred,
         SchemaType::Bytes => ValueType::Bytes,
         SchemaType::Source => ValueType::Source,
+        SchemaType::ValueStream => ValueType::Stream,
         SchemaType::Duration => ValueType::Duration,
         SchemaType::Integer => ValueType::Integer,
         SchemaType::Object(_) | SchemaType::StringMap => ValueType::Object,
@@ -290,7 +314,9 @@ mod lowering;
 pub use lowering::{compile, compile_with_capabilities};
 
 mod definition;
-pub use definition::{find_definition, find_implementation, resolve_documentation_flow};
+pub use definition::{
+    find_definition, find_implementation, resolve_documentation_codec, resolve_documentation_flow,
+};
 
 fn flow_display_name(flow: &MettleDecl, flow_id: usize) -> String {
     if let Some(name) = &flow.name {
@@ -984,5 +1010,103 @@ mod tests {
         ));
         let source = parse("flow main = json.unknown").unwrap();
         assert!(compile_with_capabilities(&source, &[JSON_DESCRIPTOR]).is_err());
+    }
+
+    #[test]
+    fn user_codecs_register_explicitly_and_keep_private_conversion_flows() {
+        let source = r#"codec temperature {
+            mediaType: "application/vnd.example.temperature"
+            aliases: ["application/x-temperature"]
+            encode(value) { value as bytes }
+            decode(bytes) { bytes }
+        }
+        use codec temperature
+        flow main = temperature.mediaType
+        flow roundTrip = temperature.decode(temperature.encode("23"))"#;
+        let program = parse(source).unwrap();
+        let plan = compile(&program).unwrap();
+        assert_eq!(plan.codecs.len(), 1);
+        assert_eq!(plan.codecs[0].media_types.len(), 2);
+        assert_eq!(plan.codecs[0].source, 0);
+        assert_eq!(
+            plan.flows
+                .iter()
+                .filter(|flow| flow.kind == super::DeclarationKind::Flow)
+                .count(),
+            2
+        );
+        assert!(plan.flows[plan.codecs[0].encode_flow].name.is_none());
+        let use_at = source.find("use codec temperature").unwrap() + "use codec ".len();
+        assert_eq!(
+            find_definition(&program, 0, use_at),
+            Some(program.codecs[0].name.span)
+        );
+        let media_at = source.rfind("temperature.mediaType").unwrap();
+        assert_eq!(
+            find_definition(&program, 0, media_at),
+            Some(program.codecs[0].name.span)
+        );
+        let encode_at = source.rfind("temperature.encode").unwrap();
+        assert_eq!(
+            find_definition(&program, 0, encode_at),
+            program.flows[program.codecs[0].encode_flow]
+                .name
+                .as_ref()
+                .map(|name| name.span)
+        );
+
+        let unregistered = parse(&source.replace("use codec temperature", "").replace(
+            "flow roundTrip = temperature.decode(temperature.encode(\"23\"))",
+            "",
+        ))
+        .unwrap();
+        assert!(compile(&unregistered).unwrap().codecs.is_empty());
+        let missing_use = parse(&source.replace("use codec temperature", "")).unwrap();
+        assert!(
+            compile(&missing_use)
+                .unwrap_err()
+                .iter()
+                .any(|error| error.message.contains("use codec"))
+        );
+    }
+
+    #[test]
+    fn codec_registration_conflicts_and_impure_bodies_are_diagnostics() {
+        let source = r#"codec a {
+            mediaType: "application/x-data"
+            encode(value) { value }
+            decode(bytes) { bytes }
+        }
+        codec b {
+            mediaType: "application/x-data"
+            encode(value) { value }
+            decode(bytes) { bytes }
+        }
+        use codec a
+        use codec b
+        flow main = 42"#;
+        let messages = errors(source);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("registered more than once")),
+            "{messages:?}"
+        );
+
+        let impure = r#"codec a {
+            mediaType: "application/x-data"
+            encode(value) { http.get("/side-effect") }
+            decode(bytes) { bytes }
+        }
+        use codec a
+        flow main = 42"#;
+        let program = parse(impure).unwrap();
+        let messages = compile_with_capabilities(&program, &[HTTP]).unwrap_err();
+        assert!(
+            messages
+                .iter()
+                .any(|error| error.message.contains("must be pure")),
+            "{messages:?}"
+        );
     }
 }

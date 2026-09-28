@@ -186,6 +186,7 @@ fn expression(
         |value: &PlanExpression| expression(value, locals, origins, capabilities, errors);
     match &value.kind {
         PlanExpressionKind::ResourceCall { receiver, .. } => visit(receiver),
+        PlanExpressionKind::CodecCall { argument, .. } => visit(argument),
         PlanExpressionKind::Member {
             value: object,
             member,
@@ -252,6 +253,9 @@ fn expression(
             }
         }
         PlanExpressionKind::Source {
+            instructions: body, ..
+        }
+        | PlanExpressionKind::ValueStream {
             instructions: body, ..
         }
         | PlanExpressionKind::Block {

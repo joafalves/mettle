@@ -33,6 +33,7 @@ pub struct ResponseStream {
     max_capture: usize,
     span: Span,
     sensitive: bool,
+    context: IoContext,
 }
 
 pub struct Settings {
@@ -46,6 +47,12 @@ pub struct Settings {
 }
 
 impl ResponseStream {
+    pub(super) fn span(&self) -> Span {
+        self.span
+    }
+    pub(super) fn sensitive(&self) -> bool {
+        self.sensitive
+    }
     pub fn new(
         incoming: Incoming,
         headers: hyper::HeaderMap,
@@ -66,6 +73,7 @@ impl ResponseStream {
             max_capture: settings.max_capture,
             span: settings.span,
             sensitive: settings.sensitive,
+            context: context.clone(),
         });
         context.register_resource(&(value.clone() as Arc<dyn IoResource>), settings.span)?;
         Ok(value)
@@ -166,6 +174,32 @@ impl DeferredField for Field {
                     span,
                 ));
             }
+            if matches!(self.kind, FieldKind::Body)
+                && !self.response.bodyless
+                && let Some(media) = &self.response.media
+            {
+                let custom = self
+                    .response
+                    .context
+                    .content_codec(self.response.span.source, media);
+                if let Some(custom) = custom.as_ref().filter(|codec| codec.incremental()) {
+                    super::incoming::validate_content_encoding(&self.response.headers, span)?;
+                    let source = self.response.chunks(&self.response.context);
+                    return custom
+                        .decode_source(
+                            source,
+                            self.response.max_capture,
+                            self.response.span,
+                            &self.response.context,
+                        )
+                        .await;
+                }
+                if media.essence == "text/event-stream" && custom.is_none() {
+                    super::incoming::validate_content_encoding(&self.response.headers, span)?;
+                    media.validate_encoding(span)?;
+                    return Ok(super::sse::source(&self.response, &self.response.context));
+                }
+            }
             let bytes = self.response.capture(span).await?;
             if matches!(self.kind, FieldKind::Bytes) {
                 return Ok(bytes);
@@ -176,8 +210,10 @@ impl DeferredField for Field {
                 &self.response.headers,
                 self.response.bodyless,
                 self.response.max_capture,
-                span,
+                self.response.span,
+                &self.response.context,
             )
+            .await
         })
     }
     fn call(&self, span: Span) -> CapabilityFuture<'_> {

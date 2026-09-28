@@ -417,7 +417,11 @@ fn check(path: &Path) -> Result<(), CliError> {
         .iter()
         .filter(|flow| flow.kind == DeclarationKind::Flow)
         .count();
-    let tests = plan.flows.len() - flows;
+    let tests = plan
+        .flows
+        .iter()
+        .filter(|flow| flow.kind == DeclarationKind::Test)
+        .count();
     if tests == 0 {
         println!(
             "Checked {} ({flows} flow{}).",
@@ -1601,6 +1605,7 @@ fn value_from_expression(expression: &Expression) -> Result<Value, &'static str>
         | ExpressionKind::Fail(_)
         | ExpressionKind::Block(_)
         | ExpressionKind::Source(_)
+        | ExpressionKind::ValueStream(_)
         | ExpressionKind::For { .. }
         | ExpressionKind::Member { .. }
         | ExpressionKind::Index { .. }
@@ -1822,7 +1827,28 @@ fn load_sources(
         })?;
         program.set_source(source_id);
         if source_id != entry_source {
-            program.flows.retain(|flow| flow.name.is_some());
+            let mut flow_ids = vec![None; program.flows.len()];
+            let mut next_flow = 0;
+            program.flows = program
+                .flows
+                .into_iter()
+                .enumerate()
+                .filter_map(|(old, flow)| {
+                    if flow.name.is_none() {
+                        None
+                    } else {
+                        flow_ids[old] = Some(next_flow);
+                        next_flow += 1;
+                        Some(flow)
+                    }
+                })
+                .collect();
+            for codec in &mut program.codecs {
+                codec.encode_flow =
+                    flow_ids[codec.encode_flow].expect("named codec encoder retained");
+                codec.decode_flow =
+                    flow_ids[codec.decode_flow].expect("named codec decoder retained");
+            }
         }
         parsed.push(program);
     }
@@ -1841,11 +1867,20 @@ fn combine_parsed_sources(
         namespace_uses: entry.namespace_uses.clone(),
         contexts: Vec::new(),
         file_contexts: Vec::new(),
+        codecs: Vec::new(),
+        codec_uses: Vec::new(),
         flows: Vec::new(),
     };
-    for source in parsed {
+    for mut source in parsed {
+        let flow_offset = program.flows.len();
+        for codec in &mut source.codecs {
+            codec.encode_flow += flow_offset;
+            codec.decode_flow += flow_offset;
+        }
         program.contexts.extend(source.contexts);
         program.file_contexts.extend(source.file_contexts);
+        program.codecs.extend(source.codecs);
+        program.codec_uses.extend(source.codec_uses);
         program.flows.extend(source.flows);
     }
     LoadedProject {

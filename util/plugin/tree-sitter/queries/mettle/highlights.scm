@@ -12,13 +12,14 @@
 (boolean) @boolean
 (null) @constant.builtin
 
-["flow" "context" "namespace" "defaults" "test"] @keyword
+["flow" "context" "codec" "namespace" "defaults" "test"] @keyword
 "use" @keyword.import
 "return" @keyword.return
 ["if" "else"] @keyword.conditional
 ["for" "in"] @keyword.repeat
 ["break" "yield"] @keyword.return
 (source_expression "source" @keyword)
+(stream_expression "stream" @keyword)
 ["within" "retry" "parallel" "rate" "concurrency"] @keyword
 ["assert" "fail"] @function.builtin
 ["and" "or" "not" "is" "as"] @keyword.operator
@@ -41,6 +42,12 @@
 (namespace_declaration name: (identifier) @module)
 (namespace_use name: (identifier) @module)
 (context_declaration name: (identifier) @type)
+(codec_declaration name: (identifier) @type)
+(codec_use name: (identifier) @type)
+(codec_method name: _ @function)
+(codec_method parameter: (identifier) @variable.parameter)
+(codec_media_type name: (identifier) @property)
+(codec_aliases name: (identifier) @property)
 (file_context_use name: (identifier) @type)
 (context_use name: (identifier) @type)
 (defaults_declaration capability: (identifier) @module)

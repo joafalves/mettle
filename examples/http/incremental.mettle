@@ -1,0 +1,81 @@
+// Run with the local fixture: python3 util/test-server/http_fixture.py --port 8080
+// mettle test examples/http/incremental.mettle
+// A streamed .body is decoded by its response media type; .chunks remains raw.
+
+codec records {
+    mediaType: "application/x-mettle-incremental"
+
+    encode(value) { text.encode(value as string) }
+    // A single decoder accepts a byte source and yields complete native records.
+    decode(input) {
+        stream {
+            for line in text.lines(input) {
+                yield { text: line }
+            }
+        }
+    }
+}
+
+use codec records
+use context {
+    defaults http {
+        headers: { Authorization: "Bearer local-test-token" }
+    }
+}
+
+test "consume a registered incremental codec" {
+    response = http.get("http://127.0.0.1:8080/content/incremental", stream: true)
+    assert(response.status == 200)
+    for index, record in response.body {
+        if (index == 0) { assert(record.text == "one") }
+        if (index == 1) { assert(record.text == "two") }
+        if (index == 2) { assert(record.text == "three") }
+    }
+}
+
+test "ordinary calls still use complete-value decoding" {
+    response = http.get("http://127.0.0.1:8080/content/incremental")
+    assert(response.body[0].text == "one")
+    assert(response.body[1].text == "two")
+    assert(response.body[2].text == "three")
+}
+
+test "direct incremental decode collects complete records" {
+    records = records.decode(text.encode("alpha\nbeta\n"))
+    assert(records[0].text == "alpha")
+    assert(records[1].text == "beta")
+}
+
+test "SSE is a decoded value stream" {
+    response = http.get("http://127.0.0.1:8080/content/events", stream: true)
+    assert(response.status == 200)
+    for index, event in response.body {
+        if (index == 0) {
+            assert(event.data == "café\nready")
+            assert(event.event == "update")
+            assert(event.id == "7")
+        } else {
+            assert(event.data == "done")
+            assert(event.event == "message")
+        }
+    }
+}
+
+test "raw response chunks are bytes" {
+    response = http.get("http://127.0.0.1:8080/content/events", stream: true)
+    for chunk in response.chunks {
+        assert(chunk is bytes)
+        break
+    }
+}
+
+test "generated and file sources can be read in loops" {
+    for index, chunk in source { yield "abc" } {
+        assert(index == 0)
+        assert(text.decode(chunk) == "abc")
+    }
+    for chunk in fs.stream("./examples/http/incremental.mettle") {
+        assert(chunk is bytes)
+        break
+    }
+}

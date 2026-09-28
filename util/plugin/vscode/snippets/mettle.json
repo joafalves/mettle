@@ -1,4 +1,38 @@
 {
+  "Complete-value codec": {
+    "prefix": "codec",
+    "description": "Declare and explicitly register a bounded media-type codec",
+    "body": [
+      "codec ${1:name} {",
+      "    mediaType: \"${2:application/vnd.example.value}\"",
+      "    encode(value) {",
+      "        ${3:text.encode(value as string)}",
+      "    }",
+      "    decode(bytes) {",
+      "        ${4:text.decode(bytes)}",
+      "    }",
+      "}",
+      "use codec ${1:name}"
+    ]
+  },
+  "Incremental codec": {
+    "prefix": "codecstream",
+    "description": "Decode byte sources into a stream of complete native records",
+    "body": [
+      "codec ${1:name} {",
+      "    mediaType: \"${2:application/vnd.example.records}\"",
+      "    encode(value) { text.encode(value as string) }",
+      "    decode(input) {",
+      "        stream {",
+      "            for line in text.lines(input) {",
+      "                yield line",
+      "            }",
+      "        }",
+      "    }",
+      "}",
+      "use codec ${1:name}"
+    ]
+  },
   "Lazy byte producer": {
     "prefix": "source",
     "description": "Produce ordered UTF-8 strings or bytes on demand",

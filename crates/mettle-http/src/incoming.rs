@@ -4,7 +4,7 @@ use hyper::header::{CONTENT_ENCODING, CONTENT_TYPE};
 use hyper::{HeaderMap, Method};
 use mettle_capability::content::BuiltinCodec;
 use mettle_capability::media_type::MediaType;
-use mettle_capability::{CapabilityError, Span, Value};
+use mettle_capability::{CapabilityError, IoContext, Span, Value};
 
 pub fn bodyless(method: &Method, status: u16) -> bool {
     *method == Method::HEAD || matches!(status, 204 | 205 | 304)
@@ -32,13 +32,14 @@ pub fn representation(
         .map_err(|_| CapabilityError::new("invalid HTTP response Content-Type", span))
 }
 
-pub fn decode(
+pub async fn decode(
     bytes: &Value,
     media: Option<&MediaType>,
     headers: &HeaderMap,
     has_no_body: bool,
     max_bytes: usize,
     span: Span,
+    context: &IoContext,
 ) -> Result<Value, CapabilityError> {
     if has_no_body {
         return Ok(if bytes.contains_sensitive() {
@@ -47,6 +48,44 @@ pub fn decode(
             Value::Null
         });
     }
+    validate_content_encoding(headers, span)?;
+    let custom = media.and_then(|media| context.content_codec(span.source, media));
+    if custom.is_none()
+        && let Some(media) = media
+    {
+        media.validate_encoding(span).map_err(|_| {
+            CapabilityError::new(
+                "HTTP response JSON/text decoding only supports charset=utf-8",
+                span,
+            )
+        })?;
+    }
+    if let Some(custom) = custom {
+        return custom
+            .decode(bytes.clone(), max_bytes, span, context)
+            .await
+            .map_err(|error| {
+                CapabilityError::new(
+                    format!("HTTP response body could not be decoded: {}", error.message),
+                    error.span,
+                )
+            });
+    }
+    media
+        .map_or(BuiltinCodec::Bytes, MediaType::codec)
+        .decode(bytes, max_bytes, span)
+        .map_err(|error| {
+            CapabilityError::new(
+                format!("HTTP response body could not be decoded: {}", error.message),
+                span,
+            )
+        })
+}
+
+pub(super) fn validate_content_encoding(
+    headers: &HeaderMap,
+    span: Span,
+) -> Result<(), CapabilityError> {
     for encoding in headers.get_all(CONTENT_ENCODING) {
         let encoding = encoding
             .to_str()
@@ -61,23 +100,7 @@ pub fn decode(
             ));
         }
     }
-    if let Some(media) = media {
-        media.validate_encoding(span).map_err(|_| {
-            CapabilityError::new(
-                "HTTP response JSON/text decoding only supports charset=utf-8",
-                span,
-            )
-        })?;
-    }
-    media
-        .map_or(BuiltinCodec::Bytes, MediaType::codec)
-        .decode(bytes, max_bytes, span)
-        .map_err(|error| {
-            CapabilityError::new(
-                format!("HTTP response body could not be decoded: {}", error.message),
-                span,
-            )
-        })
+    Ok(())
 }
 
 #[cfg(test)]
@@ -86,7 +109,7 @@ mod tests {
     use hyper::header::HeaderValue;
     use std::sync::Arc;
 
-    fn decoded(content_type: Option<&str>, input: &[u8]) -> Result<Value, CapabilityError> {
+    async fn decoded(content_type: Option<&str>, input: &[u8]) -> Result<Value, CapabilityError> {
         let mut headers = HeaderMap::new();
         if let Some(content_type) = content_type {
             headers.insert(CONTENT_TYPE, HeaderValue::from_str(content_type).unwrap());
@@ -100,11 +123,13 @@ mod tests {
             false,
             1024,
             span,
+            &IoContext::new(std::path::PathBuf::new()),
         )
+        .await
     }
 
-    #[test]
-    fn decoding_uses_native_kinds_and_never_sniffs_unknown_content() {
+    #[tokio::test]
+    async fn decoding_uses_native_kinds_and_never_sniffs_unknown_content() {
         for (input, expected) in [
             (b"null".as_slice(), Value::Null),
             (b"42".as_slice(), Value::Integer(42)),
@@ -117,16 +142,17 @@ mod tests {
                     Some("Application/Vnd.Example+JSON; charset=\"UTF-8\""),
                     input
                 )
+                .await
                 .unwrap(),
                 expected
             );
         }
         assert!(matches!(
-            decoded(Some("application/json"), b"{}").unwrap(),
+            decoded(Some("application/json"), b"{}").await.unwrap(),
             Value::Object(_)
         ));
         assert_eq!(
-            decoded(Some("text/plain"), b"{}").unwrap(),
+            decoded(Some("text/plain"), b"{}").await.unwrap(),
             Value::String("{}".into())
         );
         for media in [
@@ -135,14 +161,14 @@ mod tests {
             Some("application/x-unknown"),
         ] {
             assert_eq!(
-                decoded(media, b"{}").unwrap(),
+                decoded(media, b"{}").await.unwrap(),
                 Value::Bytes(Arc::from(b"{}".as_slice()))
             );
         }
     }
 
-    #[test]
-    fn malformed_declared_representations_fail_with_spans_and_bounds() {
+    #[tokio::test]
+    async fn malformed_declared_representations_fail_with_spans_and_bounds() {
         for (media, input) in [
             ("application/json", b"{".as_slice()),
             ("application/json", b"".as_slice()),
@@ -151,13 +177,25 @@ mod tests {
             ("text/plain; charset=\"unfinished", b"hello".as_slice()),
         ] {
             assert_eq!(
-                decoded(Some(media), input).unwrap_err().span,
+                decoded(Some(media), input).await.unwrap_err().span,
                 Span::new(10, 20)
             );
         }
         let bytes = Value::Bytes(Arc::from(b"{}".as_slice()));
         let headers = HeaderMap::new();
-        assert!(decode(&bytes, None, &headers, false, 1, Span::default()).is_err());
+        assert!(
+            decode(
+                &bytes,
+                None,
+                &headers,
+                false,
+                1,
+                Span::default(),
+                &IoContext::new(std::path::PathBuf::new())
+            )
+            .await
+            .is_err()
+        );
         let mut headers = HeaderMap::new();
         headers.append(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.append(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
@@ -169,15 +207,24 @@ mod tests {
         );
         headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
         assert!(
-            decode(&bytes, None, &headers, false, 10, Span::default())
-                .unwrap_err()
-                .message
-                .contains("Content-Encoding")
+            decode(
+                &bytes,
+                None,
+                &headers,
+                false,
+                10,
+                Span::default(),
+                &IoContext::new(std::path::PathBuf::new())
+            )
+            .await
+            .unwrap_err()
+            .message
+            .contains("Content-Encoding")
         );
     }
 
-    #[test]
-    fn absent_content_and_empty_representations_are_distinct_and_sensitive() {
+    #[tokio::test]
+    async fn absent_content_and_empty_representations_are_distinct_and_sensitive() {
         let empty = Value::Bytes(Arc::from([]));
         let headers = HeaderMap::new();
         for status in [204, 205, 304] {
@@ -193,23 +240,45 @@ mod tests {
                 &headers,
                 true,
                 10,
-                Span::default()
+                Span::default(),
+                &IoContext::new(std::path::PathBuf::new())
             )
+            .await
             .unwrap(),
             Value::Null.sensitive()
         );
         assert_eq!(
-            decode(&empty, Some(&media), &headers, true, 10, Span::default()).unwrap(),
+            decode(
+                &empty,
+                Some(&media),
+                &headers,
+                true,
+                10,
+                Span::default(),
+                &IoContext::new(std::path::PathBuf::new())
+            )
+            .await
+            .unwrap(),
             Value::Null
         );
         assert_eq!(
-            decoded(Some("text/plain"), b"").unwrap(),
+            decoded(Some("text/plain"), b"").await.unwrap(),
             Value::String(String::new())
         );
-        assert_eq!(decoded(None, b"").unwrap(), empty);
+        assert_eq!(decoded(None, b"").await.unwrap(), empty);
         let bytes = Value::Bytes(Arc::from(b"42".as_slice())).sensitive();
         assert_eq!(
-            decode(&bytes, Some(&media), &headers, false, 10, Span::default()).unwrap(),
+            decode(
+                &bytes,
+                Some(&media),
+                &headers,
+                false,
+                10,
+                Span::default(),
+                &IoContext::new(std::path::PathBuf::new())
+            )
+            .await
+            .unwrap(),
             Value::Integer(42).sensitive()
         );
     }

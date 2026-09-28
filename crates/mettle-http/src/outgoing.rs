@@ -4,7 +4,8 @@ use bytes::Bytes;
 use mettle_capability::content::BuiltinCodec;
 use mettle_capability::media_type::MediaType;
 use mettle_capability::{
-    ByteSource, CapabilityError, DEFAULT_READ_BYTES, DEFAULT_TRANSFER_BYTES, Object, Span, Value,
+    ByteSource, CapabilityError, DEFAULT_READ_BYTES, DEFAULT_TRANSFER_BYTES, IoContext, Object,
+    Span, Value,
 };
 use std::sync::Arc;
 
@@ -26,7 +27,11 @@ fn string(value: &Value, span: Span) -> Result<&str, CapabilityError> {
 }
 
 #[allow(clippy::too_many_lines)]
-pub(crate) fn prepare(options: &Object, span: Span) -> Result<PreparedBody, CapabilityError> {
+pub(crate) async fn prepare(
+    options: &Object,
+    span: Span,
+    context: &IoContext,
+) -> Result<PreparedBody, CapabilityError> {
     let payload = options.get("body").or_else(|| options.get("json"));
     let explicit_codec = options.contains_key("json").then_some(BuiltinCodec::Json);
     let headers = options.get("headers").and_then(Value::as_object);
@@ -64,6 +69,11 @@ pub(crate) fn prepare(options: &Object, span: Span) -> Result<PreparedBody, Capa
         ));
     }
     let representation = parsed_media.as_ref().or(parsed_header.as_ref());
+    let custom = if explicit_codec.is_none() {
+        representation.and_then(|media| context.content_codec(span.source, media))
+    } else {
+        None
+    };
     if explicit_codec == Some(BuiltinCodec::Json)
         && representation.is_some_and(|media| media.codec() != BuiltinCodec::Json)
     {
@@ -129,15 +139,31 @@ pub(crate) fn prepare(options: &Object, span: Span) -> Result<PreparedBody, Capa
         } else {
             // Raw values are never re-encoded, even when their media type is JSON.
             let encoder = if raw { BuiltinCodec::Bytes } else { codec };
-            if !raw && let Some(media) = representation {
+            if !raw
+                && custom.is_none()
+                && let Some(media) = representation
+            {
                 media.validate_encoding(span)?;
             }
-            let output = encoder.encode(payload, max_bytes, span).map_err(|error| {
-                CapabilityError::new(
-                    error.message.replace("maxBytes", "maxBodyBytes"),
-                    error.span,
-                )
-            })?;
+            let output = if raw {
+                encoder.encode(payload, max_bytes, span).map_err(|error| {
+                    CapabilityError::new(
+                        error.message.replace("maxBytes", "maxBodyBytes"),
+                        error.span,
+                    )
+                })?
+            } else if let Some(custom) = &custom {
+                custom
+                    .encode(payload.clone(), max_bytes, span, context)
+                    .await?
+            } else {
+                encoder.encode(payload, max_bytes, span).map_err(|error| {
+                    CapabilityError::new(
+                        error.message.replace("maxBytes", "maxBodyBytes"),
+                        error.span,
+                    )
+                })?
+            };
             let Value::Bytes(bytes) = output.revealed() else {
                 unreachable!("codecs encode bytes")
             };
@@ -160,20 +186,24 @@ pub(crate) fn prepare(options: &Object, span: Span) -> Result<PreparedBody, Capa
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn representation_selection_distinguishes_null_absence_raw_bytes_and_conflicts() {
+    async fn prepare(body: Value, media: &str) -> Result<PreparedBody, CapabilityError> {
+        super::prepare(
+            &Object::from([
+                ("body".into(), body),
+                ("mediaType".into(), Value::String(media.into())),
+            ]),
+            Span::default(),
+            &IoContext::new(std::path::PathBuf::new()),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn representation_selection_distinguishes_null_absence_raw_bytes_and_conflicts() {
         let span = Span::default();
-        let prepare = |body: Value, media: &str| {
-            super::prepare(
-                &Object::from([
-                    ("body".into(), body),
-                    ("mediaType".into(), Value::String(media.into())),
-                ]),
-                span,
-            )
-        };
         assert_eq!(
             prepare(Value::String("hello".into()), "application/json")
+                .await
                 .unwrap()
                 .bytes,
             "\"hello\""
@@ -183,24 +213,47 @@ mod tests {
                 Value::Bytes(Arc::from(b"{\"ok\":true}".as_slice())),
                 "application/json"
             )
+            .await
             .unwrap()
             .bytes,
             "{\"ok\":true}"
         );
         assert_eq!(
-            prepare(Value::Integer(23), "text/plain").unwrap().bytes,
+            prepare(Value::Integer(23), "text/plain")
+                .await
+                .unwrap()
+                .bytes,
             "23"
         );
-        assert!(prepare(Value::String("hello".into()), "application/unknown").is_err());
-        assert!(prepare(Value::String("hello".into()), "text/plain;charset=latin1").is_err());
-        let null = super::prepare(&Object::from([("body".into(), Value::Null)]), span).unwrap();
+        assert!(
+            prepare(Value::String("hello".into()), "application/unknown")
+                .await
+                .is_err()
+        );
+        assert!(
+            prepare(Value::String("hello".into()), "text/plain;charset=latin1")
+                .await
+                .is_err()
+        );
+        let null = super::prepare(
+            &Object::from([("body".into(), Value::Null)]),
+            span,
+            &IoContext::new(std::path::PathBuf::new()),
+        )
+        .await
+        .unwrap();
         assert_eq!(null.bytes, "null");
         assert_eq!(null.content_type.as_deref(), Some("application/json"));
         assert!(
-            super::prepare(&Object::new(), span)
-                .unwrap()
-                .content_type
-                .is_none()
+            super::prepare(
+                &Object::new(),
+                span,
+                &IoContext::new(std::path::PathBuf::new())
+            )
+            .await
+            .unwrap()
+            .content_type
+            .is_none()
         );
         let conflicting = Object::from([
             ("mediaType".into(), Value::String("application/json".into())),
@@ -212,6 +265,14 @@ mod tests {
                 )])),
             ),
         ]);
-        assert!(super::prepare(&conflicting, span).is_err());
+        assert!(
+            super::prepare(
+                &conflicting,
+                span,
+                &IoContext::new(std::path::PathBuf::new())
+            )
+            .await
+            .is_err()
+        );
     }
 }

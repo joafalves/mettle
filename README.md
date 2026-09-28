@@ -648,9 +648,8 @@ capturing file contents. Returning or explicitly echoing a complete value still
 outputs it with the normal sensitivity/redaction rules.
 
 Try the [filesystem project](examples/language/filesystem/main.mettle) and
-[local upload example](examples/http/file-upload.mettle). Progressive response
-consumption and custom codecs remain future phases. Ordinary HTTP responses are
-complete and bounded, with decoded `.body` values.
+[local upload example](examples/http/file-upload.mettle). Ordinary HTTP responses
+are complete and bounded by default; `stream: true` exposes a raw byte source.
 
 ### Content codecs and value kinds
 
@@ -716,9 +715,106 @@ ordinary result explicitly when it should be displayed. Try the
 [incoming content example](examples/http/incoming-content.mettle) shows native
 body kinds, metadata, bodyless responses, and explicit raw-byte decoding.
 
-Incoming `.body` values use the built-in decoders today. User-defined codecs,
-compression, scoped exchanges, and live response iteration are later work;
-raw `.bodyBytes` remain explicitly available.
+### Custom content codecs
+
+Declare a representation processor once, then explicitly register it in each
+file whose I/O calls should use it:
+
+```mettle
+codec temperature {
+    mediaType: "application/vnd.example.temperature"
+    aliases: ["application/x-temperature"]
+
+    encode(value) {
+        if (value is number) { return text.encode(value as string) }
+        assert(value is object, "Expected a number or object")
+        assert(value.celsius is number, "Expected numeric celsius")
+        text.encode(value.celsius as string)
+    }
+
+    decode(bytes) {
+        { celsius: text.decode(bytes) as number }
+    }
+}
+
+use codec temperature
+flow main = http.post("/temperature", body: { celsius: 23 }, mediaType: temperature.mediaType)
+```
+
+`temperature.mediaType` is a string constant available from the declaration;
+it does not register the codec by itself. `use codec temperature` applies to calls
+written in that source file regardless of its position. A project file can use a
+codec declared in another project file, following normal namespace visibility.
+Other files do not inherit the registration. HTTP selects an exact registered
+media type (including its declared parameters or alias) before generic `+json`
+or `text/*` fallbacks. Registered aliases select the same processor but do not
+change the announced request Content-Type. Duplicate claims in one file are
+compiler errors; canonical built-in `application/json`, `text/plain`, and
+`application/octet-stream` cannot be claimed.
+
+Within a registered file, call the same complete converter directly when
+working with files or other byte values:
+
+```mettle
+flow roundTripTemperature {
+    fs.write("./temperature.bin", temperature.encode({ celsius: 23 }), overwrite: true)
+    reading = temperature.decode(fs.read("./temperature.bin"))
+    assert(reading.celsius == 23)
+    reading
+}
+```
+
+These direct calls also require `use codec temperature`; they do not perform
+filesystem access themselves. `encode` takes one positional native value,
+and a direct `decode` call takes one positional complete byte value. For an
+incremental decoder, the direct call returns a bounded array of decoded records.
+
+An encoder takes one ordinary value and **must return bytes**. A decoder has
+one of two shapes. `decode(bytes)` returns one complete native value;
+`decode(input)` can instead return `stream { ... }`, lazily yielding complete
+native records from a byte source. The latter shape is selected when its final
+expression is a `stream` block—no extra chunk or EOF methods are declared:
+
+```mettle
+codec records {
+    mediaType: "application/x-records"
+    encode(value) { text.encode(value as string) }
+    decode(input) {
+        stream {
+            for line in text.lines(input) {
+                yield { text: line }
+            }
+        }
+    }
+}
+use codec records
+```
+
+HTTP uses the encoder for an ordinary `body` with that media type and the
+decoder for response `.body`; `.bodyBytes` and `response.chunks` remain raw.
+With `stream: true`, an incremental decoder yields records under backpressure;
+ordinary buffered calls and direct `records.decode(bytes)` collect them into
+a bounded array. `text.lines` handles UTF-8 and line boundaries across byte
+chunks. A byte source remains single-consumer, and completion of the stream
+block is EOF. Bytes and byte sources supplied as request bodies are already
+encoded and are never encoded again.
+
+This first incremental path includes bounded UTF-8 line framing and built-in
+SSE. Arbitrary binary framing still needs a dedicated incremental adapter; a
+raw transport chunk must not be treated as one complete application record.
+
+Codec bodies can use value expressions, `if`, loops, assertions, `fail`,
+and built-in `json`/`text`/`bytes` operations. Incremental decoders can use
+`stream`, `yield`, and `text.lines`; each emitted value is bounded. They cannot perform HTTP/filesystem
+I/O, call flows, read environment/context values, create byte sources, or start
+execution policies. A codec's `fail` is a conversion failure, not a terminal
+exit from the entry; an enclosing `retry` can repeat the whole request. Inputs
+and outputs are bounded to 10 MiB, and a conversion has a 30-second deadline.
+Conversion errors retain source locations and redact sensitive inputs. A media
+type names a representation, not a guarantee that decoded objects have specific
+application fields. See the executable [custom codec example](examples/http/custom-codec.mettle).
+
+Compression and scoped exchanges remain separate work; raw `.bodyBytes` remain available.
 
 ### Capability interfaces
 
@@ -896,8 +992,10 @@ not make file reading incremental. For independent transfers, put helpers in
 named `parallel` branches, each owning its response/source. See
 [parallel streaming](examples/http/streaming.mettle) and
 [offline producers](examples/language/producers.mettle).
-Current `for` loops still iterate arrays/objects; source iteration, incremental
-SSE/record processors, custom codecs, and HTTP/2 are separate future phases.
+`for` also consumes byte sources and decoded value streams once, without
+collecting loop results. Built-in SSE decoding exposes events through streamed
+`.body`; see [incremental examples](examples/http/incremental.mettle). HTTP/2
+remains future work.
 
 External data does not have to use Mettle identifier names. Use a quoted or computed string key after brackets for HTTP headers or JSON properties containing punctuation:
 
@@ -1154,7 +1252,7 @@ focused source modules.
 ## Current limits
 
 - no redirects or proxy discovery
-- request bodies support JSON, UTF-8 text, bytes, filesystem sources, and lazy generated byte producers; responses can stream raw bytes. Multipart forms and incremental decoded event/record iteration are not implemented
+- request bodies support JSON, UTF-8 text, bytes, filesystem sources, and lazy generated byte producers; responses can stream raw bytes or decoded SSE/custom records. Multipart forms are not implemented
 - no workload ramping or distributed workers yet; operation metrics are local and source-site aggregated, not distributed traces
 - the SIP capability and external capability distribution model are still planned work
 - no custom CA bundles, client certificates, or mutual TLS

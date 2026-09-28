@@ -1,13 +1,15 @@
 //! Semantic lowering and validation.
 
+mod codec;
+
 use super::{
-    BTreeMap, CapabilityDefaultsPlan, CapabilityDescriptor, CompileError, Constant, ContextMember,
-    ContextPlan, DeclarationKind, Duration, ExecutionPlan, Expression, ExpressionKind, FieldSchema,
-    FileContextUse, FlattenedContext, HashMap, HashSet, Instruction, MettleDecl, MettlePlan,
-    NameResolution, ObjectField, PlanExpression, PlanExpressionKind, PlanField, Program,
-    SchemaType, Span, Statement, StringPart, ValueType, VisitState, flow_display_name,
-    is_valid_identifier, merge_context_field, qualified_name, resolve_visible_name,
-    schema_value_type, with_name_suggestion,
+    BTreeMap, CapabilityDefaultsPlan, CapabilityDescriptor, CodecPlan, CompileError, Constant,
+    ContextMember, ContextPlan, DeclarationKind, Duration, ExecutionPlan, Expression,
+    ExpressionKind, FieldSchema, FileContextUse, FlattenedContext, HashMap, HashSet, Instruction,
+    MettleDecl, MettlePlan, NameResolution, ObjectField, PlanExpression, PlanExpressionKind,
+    PlanField, Program, SchemaType, Span, Statement, StringPart, ValueType, VisitState,
+    flow_display_name, is_valid_identifier, merge_context_field, qualified_name,
+    resolve_visible_name, schema_value_type, with_name_suggestion,
 };
 
 fn expression_block_return(statements: &[Statement]) -> Option<Span> {
@@ -83,6 +85,8 @@ struct Compiler<'a> {
     bindings: Vec<super::semantics::BindingSource>,
     loop_depth: usize,
     source_depth: usize,
+    value_stream_depth: usize,
+    registered_codecs: Vec<CodecPlan>,
 }
 
 impl<'a> Compiler<'a> {
@@ -99,6 +103,8 @@ impl<'a> Compiler<'a> {
             bindings: Vec::new(),
             loop_depth: 0,
             source_depth: 0,
+            value_stream_depth: 0,
+            registered_codecs: Vec::new(),
         }
     }
 
@@ -122,14 +128,21 @@ impl<'a> Compiler<'a> {
         self.collect_context_names();
         self.collect_flow_names();
         self.validate_file_contexts();
+        let codecs = self.compile_codecs();
+        self.registered_codecs.clone_from(&codecs);
 
         let default_flow = self.flow_ids.get("main").copied();
         let contexts = self.compile_contexts();
         let mut flows = Vec::with_capacity(self.program.flows.len());
         for (flow_id, flow) in self.program.flows.iter().enumerate() {
-            let file_context = self.resolve_file_context(flow);
+            let file_context = if flow.kind == DeclarationKind::Codec {
+                None
+            } else {
+                self.resolve_file_context(flow)
+            };
             flows.push(self.compile_flow(flow_id, flow, file_context));
         }
+        self.validate_codec_bodies(&flows);
         self.detect_recursion();
         if self.errors.is_empty() {
             self.errors.extend(super::result_migrations::check(
@@ -146,6 +159,7 @@ impl<'a> Compiler<'a> {
                 .map(|capability| capability.name.to_owned())
                 .collect(),
             contexts,
+            codecs,
             flows,
             default_flow,
         };
@@ -184,6 +198,9 @@ impl<'a> Compiler<'a> {
     fn collect_flow_names(&mut self) {
         let mut test_names = HashMap::new();
         for (index, flow) in self.program.flows.iter().enumerate() {
+            if flow.kind == DeclarationKind::Codec {
+                continue;
+            }
             let Some(name) = &flow.name else {
                 continue;
             };
@@ -519,6 +536,15 @@ impl<'a> Compiler<'a> {
         let mut local_context_seen = false;
         let mut executable_seen = false;
         for statement in &flow.body {
+            if flow.kind == DeclarationKind::Codec
+                && let Statement::UseContext { span, .. } = statement
+            {
+                self.errors.push(CompileError::new(
+                    "codec conversion bodies cannot apply contexts",
+                    *span,
+                ));
+                continue;
+            }
             match statement {
                 Statement::UseContext { name, span } if !executable_seen => {
                     let error_count = self.errors.len();
@@ -557,7 +583,7 @@ impl<'a> Compiler<'a> {
         let active_context = contexts.first().copied();
 
         let mut body = flow.body.clone();
-        if flow.kind == DeclarationKind::Flow
+        if flow.kind != DeclarationKind::Test
             && let Some(Statement::Expression(expression)) = body.last().cloned()
         {
             let span = expression.span;
@@ -575,7 +601,7 @@ impl<'a> Compiler<'a> {
             true,
         );
 
-        if !returned && flow.kind == DeclarationKind::Flow {
+        if !returned && flow.kind != DeclarationKind::Test {
             let display_name = flow_display_name(flow, flow_id);
             self.errors.push(CompileError::new(
                 format!("flow `{display_name}` must end with a return value"),
@@ -637,19 +663,21 @@ impl<'a> Compiler<'a> {
                     stopped = true;
                 }
                 Statement::Yield { expression, span } => {
-                    if self.source_depth == 0 {
+                    if self.source_depth == 0 && self.value_stream_depth == 0 {
                         self.errors.push(CompileError::new(
-                            "`yield` is only allowed in a source producer",
+                            "`yield` is only allowed in a source or stream producer",
                             *span,
                         ));
                     }
                     if let Some(value) =
                         self.compile_expression(Some(flow_id), expression, locals, active_context)
                     {
-                        if !matches!(
-                            value.value_type,
-                            ValueType::String | ValueType::Bytes | ValueType::Inferred
-                        ) {
+                        if self.source_depth > 0
+                            && !matches!(
+                                value.value_type,
+                                ValueType::String | ValueType::Bytes | ValueType::Inferred
+                            )
+                        {
                             self.errors.push(CompileError::new(
                                 "`yield` requires a string or bytes",
                                 value.span,
@@ -874,7 +902,7 @@ impl<'a> Compiler<'a> {
                 ValueType::Duration,
             ),
             ExpressionKind::String(value) => {
-                return self.compile_string(value, expression.span, locals, context);
+                return self.compile_string(value, expression.span, locals, context, current_flow);
             }
             ExpressionKind::Fail(message) => {
                 let message = self.compile_expression(current_flow, message, locals, context)?;
@@ -890,7 +918,7 @@ impl<'a> Compiler<'a> {
                 )
             }
             ExpressionKind::Name(name) => {
-                return self.resolve_name(name, expression.span, locals, context);
+                return self.resolve_name(name, expression.span, locals, context, current_flow);
             }
             ExpressionKind::Array(values) => {
                 let values = values
@@ -917,6 +945,7 @@ impl<'a> Compiler<'a> {
                 let mut next_slot = locals.values().copied().max().map_or(0, |slot| slot + 1);
                 let flow = self.program.flows[flow_id].clone();
                 let previous_loop = std::mem::replace(&mut self.loop_depth, 0);
+                let previous_stream = std::mem::replace(&mut self.value_stream_depth, 0);
                 self.source_depth += 1;
                 let (instructions, _) = self.compile_statements(
                     flow_id,
@@ -929,12 +958,47 @@ impl<'a> Compiler<'a> {
                 );
                 self.source_depth -= 1;
                 self.loop_depth = previous_loop;
+                self.value_stream_depth = previous_stream;
                 (
                     PlanExpressionKind::Source {
                         instructions,
                         local_count: next_slot,
                     },
                     ValueType::Source,
+                )
+            }
+            ExpressionKind::ValueStream(statements) => {
+                let flow_id = current_flow?;
+                if let Some(span) = expression_block_return(statements) {
+                    self.errors.push(CompileError::new(
+                        "`return` cannot exit a value stream producer; let its block complete",
+                        span,
+                    ));
+                }
+                let mut scope = locals.clone();
+                let mut next_slot = locals.values().copied().max().map_or(0, |slot| slot + 1);
+                let flow = self.program.flows[flow_id].clone();
+                let previous_loop = std::mem::replace(&mut self.loop_depth, 0);
+                let previous_source = std::mem::replace(&mut self.source_depth, 0);
+                self.value_stream_depth += 1;
+                let (instructions, _) = self.compile_statements(
+                    flow_id,
+                    &flow,
+                    statements,
+                    &mut scope,
+                    &mut next_slot,
+                    context,
+                    false,
+                );
+                self.value_stream_depth -= 1;
+                self.source_depth = previous_source;
+                self.loop_depth = previous_loop;
+                (
+                    PlanExpressionKind::ValueStream {
+                        instructions,
+                        local_count: next_slot,
+                    },
+                    ValueType::Stream,
                 )
             }
             ExpressionKind::Block(statements) => {
@@ -959,6 +1023,7 @@ impl<'a> Compiler<'a> {
                 flow.kind = DeclarationKind::Flow;
                 let previous_loop = std::mem::replace(&mut self.loop_depth, 0);
                 let previous_source = std::mem::replace(&mut self.source_depth, 0);
+                let previous_stream = std::mem::replace(&mut self.value_stream_depth, 0);
                 let (instructions, returns_value) = self.compile_statements(
                     flow_id,
                     &flow,
@@ -970,6 +1035,7 @@ impl<'a> Compiler<'a> {
                 );
                 self.loop_depth = previous_loop;
                 self.source_depth = previous_source;
+                self.value_stream_depth = previous_stream;
                 if !returns_value {
                     self.errors.push(CompileError::new(
                         "execution block must end with a value",
@@ -1004,10 +1070,14 @@ impl<'a> Compiler<'a> {
                 let iterable = self.compile_expression(current_flow, iterable, locals, context)?;
                 if !matches!(
                     iterable.value_type,
-                    ValueType::Array | ValueType::Object | ValueType::Inferred
+                    ValueType::Array
+                        | ValueType::Object
+                        | ValueType::Source
+                        | ValueType::Stream
+                        | ValueType::Inferred
                 ) {
                     self.errors.push(CompileError::new(
-                        "`for` requires an array or object",
+                        "`for` requires an array, object, or source",
                         iterable.span,
                     ));
                 }
@@ -1052,11 +1122,14 @@ impl<'a> Compiler<'a> {
                 });
                 let mut body = body.clone();
                 if let Some(Statement::Expression(result)) = body.last().cloned() {
-                    let span = result.span;
-                    *body.last_mut().expect("last statement exists") = Statement::Return {
-                        expression: result,
-                        span,
-                    };
+                    let is_echo = matches!(&result.kind, ExpressionKind::Call { callee, .. } if callee.value == "echo");
+                    if !is_echo {
+                        let span = result.span;
+                        *body.last_mut().expect("last statement exists") = Statement::Return {
+                            expression: result,
+                            span,
+                        };
+                    }
                 }
                 let mut flow = self.program.flows[flow_id].clone();
                 flow.kind = DeclarationKind::Flow;
@@ -1071,6 +1144,14 @@ impl<'a> Compiler<'a> {
                     false,
                 );
                 self.loop_depth -= 1;
+                if produces_value
+                    && matches!(iterable.value_type, ValueType::Source | ValueType::Stream)
+                {
+                    self.errors.push(CompileError::new(
+                        "a source loop cannot collect results; write its effects inside the loop",
+                        expression.span,
+                    ));
+                }
                 (
                     PlanExpressionKind::For {
                         iterable: Box::new(iterable),
@@ -1534,6 +1615,71 @@ impl<'a> Compiler<'a> {
             });
         }
 
+        if let Some((codec_name, method)) = callee.value.rsplit_once('.')
+            && matches!(method, "encode" | "decode")
+            && let Some(flow_id) = current_flow
+        {
+            let owner = &self.program.flows[flow_id];
+            let ids = self
+                .program
+                .codecs
+                .iter()
+                .enumerate()
+                .map(|(id, codec)| (qualified_name(&codec.namespace, &codec.name.value), id))
+                .collect();
+            if let NameResolution::Found(codec_id) =
+                resolve_visible_name(&ids, codec_name, &owner.namespace, &owner.namespace_uses)
+            {
+                if arguments.len() != 1 || !named_arguments.is_empty() || !options.is_empty() {
+                    self.errors.push(CompileError::new(
+                        "codec encode/decode takes exactly one positional argument",
+                        span,
+                    ));
+                    return None;
+                }
+                let codec = &self.program.codecs[codec_id];
+                let qualified = qualified_name(&codec.namespace, &codec.name.value);
+                let Some(registration) = self.registered_codecs.iter().find(|registered| {
+                    registered.source == span.source && registered.name == qualified
+                }) else {
+                    self.errors.push(CompileError::new(
+                        format!("`use codec {codec_name}` is required before calling its conversion methods in this file"),
+                        callee.span,
+                    ));
+                    return None;
+                };
+                let media_type = registration.media_types.first().cloned()?;
+                let argument =
+                    self.compile_expression(current_flow, &arguments[0], locals, context)?;
+                if method == "decode"
+                    && !matches!(argument.value_type, ValueType::Bytes | ValueType::Inferred)
+                {
+                    self.errors.push(CompileError::new(
+                        "codec decode expects complete bytes",
+                        arguments[0].span,
+                    ));
+                }
+                return Some(PlanExpression {
+                    kind: PlanExpressionKind::CodecCall {
+                        media_type,
+                        flow: if method == "encode" {
+                            codec.encode_flow
+                        } else {
+                            codec.decode_flow
+                        },
+                        encode: method == "encode",
+                        argument: Box::new(argument),
+                    },
+                    value_type: if method == "encode" {
+                        ValueType::Bytes
+                    } else {
+                        ValueType::Inferred
+                    },
+                    span,
+                });
+            }
+        }
+
         if let Some((receiver, method)) = callee.value.rsplit_once('.')
             && let root = receiver.split('.').next().unwrap_or(receiver)
             && locals.contains_key(root)
@@ -1546,7 +1692,8 @@ impl<'a> Compiler<'a> {
                 ));
                 return None;
             }
-            let receiver = self.resolve_name(receiver, callee.span, locals, context)?;
+            let receiver =
+                self.resolve_name(receiver, callee.span, locals, context, current_flow)?;
             return Some(PlanExpression {
                 kind: PlanExpressionKind::ResourceCall {
                     receiver: Box::new(receiver),
@@ -1904,14 +2051,17 @@ impl<'a> Compiler<'a> {
             SchemaType::NullableObject(_) => {
                 matches!(value.value_type, ValueType::Object | ValueType::Null)
             }
-            SchemaType::Body => value.value_type != ValueType::Duration,
+            SchemaType::Body => {
+                !matches!(value.value_type, ValueType::Duration | ValueType::Stream)
+            }
             SchemaType::Json => !matches!(
                 value.value_type,
-                ValueType::Duration | ValueType::Source | ValueType::Bytes
+                ValueType::Duration | ValueType::Source | ValueType::Stream | ValueType::Bytes
             ),
             SchemaType::Bytes => value.value_type == ValueType::Bytes,
             SchemaType::Encoded => matches!(value.value_type, ValueType::String | ValueType::Bytes),
             SchemaType::Source => value.value_type == ValueType::Source,
+            SchemaType::ValueStream => value.value_type == ValueType::Stream,
             SchemaType::Writable => matches!(
                 value.value_type,
                 ValueType::String | ValueType::Bytes | ValueType::Source
@@ -1958,6 +2108,7 @@ impl<'a> Compiler<'a> {
         span: Span,
         locals: &HashMap<String, usize>,
         context: Option<usize>,
+        current_flow: Option<usize>,
     ) -> Option<PlanExpression> {
         if !value.contains("${") {
             return Some(PlanExpression {
@@ -1987,7 +2138,8 @@ impl<'a> Compiler<'a> {
                 ));
                 return None;
             }
-            let expression = self.resolve_interpolation_name(name, span, locals, context)?;
+            let expression =
+                self.resolve_interpolation_name(name, span, locals, context, current_flow)?;
             parts.push(StringPart::Value(expression));
             remaining = &after_start[end + 1..];
         }
@@ -2007,8 +2159,9 @@ impl<'a> Compiler<'a> {
         span: Span,
         locals: &HashMap<String, usize>,
         context: Option<usize>,
+        current_flow: Option<usize>,
     ) -> Option<PlanExpression> {
-        if let Some(expression) = self.try_resolve_name(name, span, locals, context) {
+        if let Some(expression) = self.try_resolve_name(name, span, locals, context, current_flow) {
             return Some(expression);
         }
         let root = name
@@ -2028,8 +2181,9 @@ impl<'a> Compiler<'a> {
         span: Span,
         locals: &HashMap<String, usize>,
         context: Option<usize>,
+        current_flow: Option<usize>,
     ) -> Option<PlanExpression> {
-        if let Some(expression) = self.try_resolve_name(name, span, locals, context) {
+        if let Some(expression) = self.try_resolve_name(name, span, locals, context, current_flow) {
             return Some(expression);
         }
         if !name.contains('.') {
@@ -2052,9 +2206,49 @@ impl<'a> Compiler<'a> {
         span: Span,
         locals: &HashMap<String, usize>,
         context: Option<usize>,
+        current_flow: Option<usize>,
     ) -> Option<PlanExpression> {
         let mut parts = name.split('.');
         let root = parts.next().expect("split always returns one part");
+        if !locals.contains_key(root)
+            && !context.is_some_and(|context| self.context_fields[context].contains_key(root))
+            && let Some(codec_name) = name.strip_suffix(".mediaType")
+        {
+            let ids = self
+                .program
+                .codecs
+                .iter()
+                .enumerate()
+                .map(|(id, codec)| (qualified_name(&codec.namespace, &codec.name.value), id))
+                .collect();
+            let owner = current_flow
+                .and_then(|id| self.program.flows.get(id))
+                .or_else(|| {
+                    self.program
+                        .flows
+                        .iter()
+                        .find(|flow| flow.span.source == span.source)
+                });
+            let namespace = owner.map_or("", |flow| flow.namespace.as_str());
+            let uses = owner.map_or(&[][..], |flow| flow.namespace_uses.as_slice());
+            if let NameResolution::Found(id) =
+                resolve_visible_name(&ids, codec_name, namespace, uses)
+            {
+                let codec = &self.program.codecs[id];
+                return Some(PlanExpression {
+                    kind: PlanExpressionKind::Constant(Constant::String(
+                        mettle_capability::media_type::MediaType::parse(
+                            &codec.media_type.value,
+                            codec.media_type.span,
+                        )
+                        .ok()?
+                        .normalized(),
+                    )),
+                    value_type: ValueType::String,
+                    span,
+                });
+            }
+        }
         let mut expression = if let Some(slot) = locals.get(root).copied() {
             PlanExpression {
                 kind: PlanExpressionKind::Local(slot),

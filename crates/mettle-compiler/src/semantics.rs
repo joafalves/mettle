@@ -72,6 +72,7 @@ impl ValueInfo {
         let kind = match self.kind {
             ValueType::Inferred => "value (kind determined at runtime)",
             ValueType::Source => "byte source",
+            ValueType::Stream => "value stream",
             _ => self.kind.name(),
         };
         if self.nullable {
@@ -449,9 +450,31 @@ impl Analyzer<'_> {
             return ValueInfo::unknown();
         }
         let mut info = match &expression.kind {
+            PlanExpressionKind::CodecCall {
+                encode,
+                flow: called,
+                argument,
+                ..
+            } => {
+                let input = self.expression(argument, locals, flow, context, depth + 1);
+                let mut result = if *encode {
+                    ValueInfo::new(ValueType::Bytes, Sensitivity::Public)
+                } else {
+                    self.flow(*called, depth + 1)
+                };
+                if !encode && result.kind == ValueType::Stream {
+                    result.kind = ValueType::Array;
+                }
+                result.sensitivity = composite(result.sensitivity, input.sensitivity);
+                result
+            }
             PlanExpressionKind::Source { instructions, .. } => {
                 self.block(instructions, &mut locals.clone(), flow, context, depth + 1);
                 ValueInfo::new(ValueType::Source, Sensitivity::Unknown)
+            }
+            PlanExpressionKind::ValueStream { instructions, .. } => {
+                self.block(instructions, &mut locals.clone(), flow, context, depth + 1);
+                ValueInfo::new(ValueType::Stream, Sensitivity::Unknown)
             }
             PlanExpressionKind::ResourceCall { receiver, .. } => {
                 self.expression(receiver, locals, flow, context, depth + 1);
@@ -570,6 +593,12 @@ impl Analyzer<'_> {
                 let descriptor = &self.capabilities[*capability];
                 let operation = &descriptor.operations[*operation];
                 let mut info = schema(operation.result, depth + 1, &mut self.steps);
+                if descriptor.name == "text" && operation.name == "lines" {
+                    info.element = Some(Arc::new(ValueInfo::new(
+                        ValueType::String,
+                        Sensitivity::Unknown,
+                    )));
+                }
                 info.operation = Some(format!("{}.{}", descriptor.name, operation.name).into());
                 info
             }
@@ -618,6 +647,9 @@ impl Analyzer<'_> {
                         )
                     })
                     .unwrap_or_else(ValueInfo::unknown);
+                if iterable.kind == ValueType::Source {
+                    value = ValueInfo::new(ValueType::Bytes, Sensitivity::Unknown);
+                }
                 if iterable.wrapped_sensitive {
                     value.sensitivity = Sensitivity::Sensitive;
                     value.wrapped_sensitive = true;
@@ -633,7 +665,9 @@ impl Analyzer<'_> {
                 }
                 if let Some(slot) = key_slot {
                     let kind = match iterable.kind {
-                        ValueType::Array => ValueType::Integer,
+                        ValueType::Array | ValueType::Source | ValueType::Stream => {
+                            ValueType::Integer
+                        }
                         ValueType::Object => ValueType::String,
                         _ => ValueType::Inferred,
                     };

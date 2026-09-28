@@ -2,6 +2,12 @@
 
 ## 1.0.0-alpha.1
 
+- Add `codec`/`use codec` highlighting and a declaration snippet; the language
+  server resolves custom media-type constants, definitions, and registration
+  hovers from the Rust compiler and syntax trees.
+- Add a single-`decode` incremental codec snippet using `stream`/`yield`, with
+  source-backed value-stream highlighting and compiler/LSP diagnostics.
+
 - Add `source`/`yield` and `break` highlighting/snippets, a streamed-download
   snippet, and schema-backed hovers for bounded text/regex and live HTTP fields.
 

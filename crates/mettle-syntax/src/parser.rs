@@ -1,9 +1,9 @@
 //! Source parsing and grammar rules.
 
 use super::{
-    BinaryOperator, ContextDecl, ContextMember, DeclarationKind, Expression, ExpressionKind,
-    FileContextUse, IfBranch, MettleDecl, ObjectField, ParallelBranch, Program, Span, Spanned,
-    Statement, SyntaxError, Token, TokenKind, lex,
+    BinaryOperator, CodecDecl, CodecUse, ContextDecl, ContextMember, DeclarationKind, Expression,
+    ExpressionKind, FileContextUse, IfBranch, MettleDecl, ObjectField, ParallelBranch, Program,
+    Span, Spanned, Statement, SyntaxError, Token, TokenKind, lex,
 };
 
 /// Parse a complete Mettle source file.
@@ -51,6 +51,8 @@ impl<'a> Parser<'a> {
         let mut namespace_uses = Vec::new();
         let mut contexts = Vec::new();
         let mut file_contexts = Vec::new();
+        let mut codecs = Vec::new();
+        let mut codec_uses = Vec::new();
         let mut flows = Vec::new();
         while !self.at(&TokenKind::End) {
             if self.at(&TokenKind::Namespace) {
@@ -66,30 +68,22 @@ impl<'a> Parser<'a> {
                 let start = self.advance().span;
                 if self.take_if(&TokenKind::Namespace) {
                     namespace_uses.push(self.take_identifier("a namespace name")?);
-                } else {
-                    self.take(&TokenKind::Context)?;
-                    if self.at(&TokenKind::LeftBrace) {
-                        let mut context = self.parse_context_body(start, None)?;
-                        file_contexts.push(FileContextUse::Inline(context.span));
-                        context.namespace = namespace
+                } else if self.take_if(&TokenKind::Codec) {
+                    codec_uses.push(CodecUse {
+                        namespace: namespace
                             .as_ref()
-                            .map_or_else(String::new, |name| name.value.clone());
-                        context.namespace_uses.clone_from(&namespace_uses);
-                        contexts.push(context);
-                    } else {
-                        let name = self.take_identifier("a context name")?;
-                        if self.at(&TokenKind::LeftBrace) {
-                            let mut context = self.parse_context_body(start, Some(name.clone()))?;
-                            file_contexts.push(FileContextUse::Named(name));
-                            context.namespace = namespace
-                                .as_ref()
-                                .map_or_else(String::new, |name| name.value.clone());
-                            context.namespace_uses.clone_from(&namespace_uses);
-                            contexts.push(context);
-                        } else {
-                            file_contexts.push(FileContextUse::Named(name));
-                        }
-                    }
+                            .map_or_else(String::new, |name| name.value.clone()),
+                        namespace_uses: namespace_uses.clone(),
+                        name: self.take_identifier("a codec name")?,
+                    });
+                } else {
+                    self.parse_file_context_use(
+                        start,
+                        namespace.as_ref(),
+                        &namespace_uses,
+                        &mut file_contexts,
+                        &mut contexts,
+                    )?;
                 }
             } else if self.at(&TokenKind::Context) {
                 let mut context = self.parse_context()?;
@@ -98,6 +92,19 @@ impl<'a> Parser<'a> {
                     .map_or_else(String::new, |name| name.value.clone());
                 context.namespace_uses.clone_from(&namespace_uses);
                 contexts.push(context);
+            } else if self.at(&TokenKind::Codec) {
+                let (mut codec, mut methods) = self.parse_codec()?;
+                codec.namespace = namespace
+                    .as_ref()
+                    .map_or_else(String::new, |name| name.value.clone());
+                codec.encode_flow = flows.len();
+                codec.decode_flow = flows.len() + 1;
+                for mut method in methods.drain(..) {
+                    method.namespace.clone_from(&codec.namespace);
+                    method.namespace_uses.clone_from(&namespace_uses);
+                    flows.push(method);
+                }
+                codecs.push(codec);
             } else if self.at(&TokenKind::Mettle) {
                 let mut flow = self.parse_flow()?;
                 flow.namespace = namespace
@@ -126,7 +133,175 @@ impl<'a> Parser<'a> {
             namespace_uses,
             contexts,
             file_contexts,
+            codecs,
+            codec_uses,
             flows,
+        })
+    }
+
+    fn parse_file_context_use(
+        &mut self,
+        start: Span,
+        namespace: Option<&Spanned<String>>,
+        namespace_uses: &[Spanned<String>],
+        file_contexts: &mut Vec<FileContextUse>,
+        contexts: &mut Vec<ContextDecl>,
+    ) -> Result<(), SyntaxError> {
+        self.take(&TokenKind::Context)?;
+        let name = if self.at(&TokenKind::LeftBrace) {
+            None
+        } else {
+            Some(self.take_identifier("a context name")?)
+        };
+        if self.at(&TokenKind::LeftBrace) {
+            let mut context = self.parse_context_body(start, name.clone())?;
+            file_contexts
+                .push(name.map_or(FileContextUse::Inline(context.span), FileContextUse::Named));
+            context.namespace = namespace.map_or_else(String::new, |name| name.value.clone());
+            context.namespace_uses = namespace_uses.to_vec();
+            contexts.push(context);
+        } else if let Some(name) = name {
+            file_contexts.push(FileContextUse::Named(name));
+        }
+        Ok(())
+    }
+
+    fn parse_codec(&mut self) -> Result<(CodecDecl, Vec<MettleDecl>), SyntaxError> {
+        let start = self.take(&TokenKind::Codec)?.span;
+        let name = self.take_identifier("a codec name")?;
+        self.take(&TokenKind::LeftBrace)?;
+        let mut media_type = None;
+        let mut aliases = None;
+        let mut encode = None;
+        let mut decode = None;
+        while !self.at(&TokenKind::RightBrace) {
+            if self.at(&TokenKind::End) {
+                return Err(self.expected("a codec member or `}`"));
+            }
+            let member = self.take_identifier("a codec member")?;
+            match member.value.as_str() {
+                "mediaType" => {
+                    let value = self.parse_codec_media_type()?;
+                    if media_type.replace(value).is_some() {
+                        return Err(SyntaxError::new(
+                            "codec mediaType is declared more than once",
+                            member.span,
+                        ));
+                    }
+                }
+                "aliases" => {
+                    let values = self.parse_codec_aliases()?;
+                    if aliases.replace(values).is_some() {
+                        return Err(SyntaxError::new(
+                            "codec aliases are declared more than once",
+                            member.span,
+                        ));
+                    }
+                }
+                "encode" | "decode" => {
+                    let flow = self.parse_codec_method(&name, &member)?;
+                    let target = if member.value == "encode" {
+                        &mut encode
+                    } else {
+                        &mut decode
+                    };
+                    if target.replace(flow).is_some() {
+                        return Err(SyntaxError::new(
+                            "codec method is declared more than once",
+                            member.span,
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(SyntaxError::new(
+                        "expected mediaType, aliases, encode, or decode",
+                        member.span,
+                    ));
+                }
+            }
+            self.require_separator("codec members")?;
+        }
+        let end = self.take(&TokenKind::RightBrace)?.span;
+        let media_type = media_type
+            .ok_or_else(|| SyntaxError::new("codec requires mediaType", start.join(end)))?;
+        let encode = encode
+            .ok_or_else(|| SyntaxError::new("codec requires encode(value)", start.join(end)))?;
+        let decode = decode
+            .ok_or_else(|| SyntaxError::new("codec requires decode(bytes)", start.join(end)))?;
+        let methods = vec![encode, decode];
+        Ok((
+            CodecDecl {
+                namespace: String::new(),
+                name,
+                media_type,
+                aliases: aliases.unwrap_or_default(),
+                encode_flow: 0,
+                decode_flow: 0,
+                span: start.join(end),
+            },
+            methods,
+        ))
+    }
+
+    fn parse_codec_media_type(&mut self) -> Result<Spanned<String>, SyntaxError> {
+        self.take(&TokenKind::Colon)?;
+        let value = self.advance();
+        let TokenKind::String(value_string) = value.kind else {
+            return Err(SyntaxError::new(
+                "codec mediaType must be a string literal",
+                value.span,
+            ));
+        };
+        Ok(Spanned {
+            value: value_string,
+            span: value.span,
+        })
+    }
+
+    fn parse_codec_aliases(&mut self) -> Result<Vec<Spanned<String>>, SyntaxError> {
+        self.take(&TokenKind::Colon)?;
+        self.take(&TokenKind::LeftBracket)?;
+        let mut values = Vec::new();
+        while !self.at(&TokenKind::RightBracket) {
+            let value = self.advance();
+            let TokenKind::String(value_string) = value.kind else {
+                return Err(SyntaxError::new(
+                    "codec aliases must be string literals",
+                    value.span,
+                ));
+            };
+            values.push(Spanned {
+                value: value_string,
+                span: value.span,
+            });
+            if !self.take_if(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.take(&TokenKind::RightBracket)?;
+        Ok(values)
+    }
+
+    fn parse_codec_method(
+        &mut self,
+        name: &Spanned<String>,
+        member: &Spanned<String>,
+    ) -> Result<MettleDecl, SyntaxError> {
+        self.take(&TokenKind::LeftParen)?;
+        let parameter = self.take_identifier("a codec input parameter")?;
+        self.take(&TokenKind::RightParen)?;
+        let (body, end) = self.parse_statement_block()?;
+        Ok(MettleDecl {
+            kind: DeclarationKind::Codec,
+            namespace: String::new(),
+            namespace_uses: Vec::new(),
+            name: Some(Spanned {
+                value: format!("{}.{}", name.value, member.value),
+                span: member.span,
+            }),
+            parameters: vec![parameter],
+            body,
+            span: member.span.join(end),
         })
     }
 
@@ -529,6 +704,13 @@ impl<'a> Parser<'a> {
                 value
             }
             TokenKind::Identifier(value) => {
+                if value == "stream" && self.at(&TokenKind::LeftBrace) {
+                    let (body, end) = self.parse_statement_block()?;
+                    return self.parse_member_access(literal(
+                        ExpressionKind::ValueStream(body),
+                        token.span.join(end),
+                    ));
+                }
                 let mut name = value;
                 let mut span = token.span;
                 while self.at(&TokenKind::Dot)
@@ -1043,6 +1225,7 @@ const fn token_description(token: &TokenKind) -> &'static str {
         TokenKind::Mettle => "`flow`",
         TokenKind::Test => "`test`",
         TokenKind::Context => "`context`",
+        TokenKind::Codec => "`codec`",
         TokenKind::Namespace => "`namespace`",
         TokenKind::Defaults => "`defaults`",
         TokenKind::Use => "`use`",

@@ -93,6 +93,27 @@ const TEXT_OPERATIONS: &[OperationSchema] = &[
     text_ops::FIND,
     text_ops::FIND_ALL,
     text_ops::REPLACE,
+    OperationSchema {
+        name: "lines",
+        documentation: OperationDocumentation {
+            summary: "Decode an owned byte source into a one-consumer stream of complete UTF-8 lines without collecting the file or response.",
+            notes: &[
+                "A line may cross byte chunks. LF and CRLF separators are removed; a final unterminated line is emitted. Invalid UTF-8 or an oversized line fails. A value stream cannot be used as an outbound byte body.",
+            ],
+            parameters: &[
+                "Owned byte source, such as fs.stream(path) or response.chunks. Its aliases share one consumption claim.",
+            ],
+            details: "Lines are pulled only when a for loop consumes the returned value stream. Break or failure drops the reader and closes an unfinished HTTP response. There is no implicit collection or replay.",
+            example: "for line in text.lines(fs.stream(\"./events.log\")) { echo(line) }",
+        },
+        parameters: &[SchemaType::Source],
+        parameter_names: &["source"],
+        options: &[FieldSchema::new("maxLineBytes", SchemaType::Integer)
+            .documented("Positive upper bound for one line, default 64 KiB; at most 10 MiB.")
+            .with_default(DefaultValue::Bytes(64 * 1024))],
+        mutually_exclusive: &[],
+        result: SchemaType::ValueStream,
+    },
 ];
 const BYTE_OPERATIONS: &[OperationSchema] = &[
     OperationSchema {
@@ -187,6 +208,7 @@ impl Capability for CodecCapability {
             4 if self.0 == BuiltinCodec::Text => "find",
             5 if self.0 == BuiltinCodec::Text => "findAll",
             6 if self.0 == BuiltinCodec::Text => "replace",
+            7 if self.0 == BuiltinCodec::Text => "lines",
             _ => "unknown",
         }
     }
@@ -199,6 +221,12 @@ impl Capability for CodecCapability {
     ) -> CapabilityFuture<'_> {
         Box::pin(async move {
             if self.0 == BuiltinCodec::Text && operation >= 2 {
+                if operation == 7 {
+                    return Err(CapabilityError::new(
+                        "text.lines requires an execution-owned I/O context",
+                        span,
+                    ));
+                }
                 let context = crate::IoContext::new(std::path::PathBuf::new());
                 let result = text_ops::invoke(operation, arguments, options, span, &context).await;
                 context.cleanup().await?;
@@ -234,6 +262,24 @@ impl Capability for CodecCapability {
         context: &'a crate::IoContext,
     ) -> CapabilityFuture<'a> {
         if self.0 == BuiltinCodec::Text && operation >= 2 {
+            if operation == 7 {
+                return Box::pin(async move {
+                    let source = arguments.first().ok_or_else(|| {
+                        CapabilityError::new("text.lines requires a byte source", span)
+                    })?;
+                    let max_line = match options.get("maxLineBytes") {
+                        None => None,
+                        Some(Value::Integer(value)) => Some(*value),
+                        _ => {
+                            return Err(CapabilityError::new(
+                                "maxLineBytes must be a positive integer",
+                                span,
+                            ));
+                        }
+                    };
+                    crate::text_lines::invoke(source, max_line, span, context)
+                });
+            }
             Box::pin(text_ops::invoke(
                 operation, arguments, options, span, context,
             ))

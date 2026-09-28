@@ -26,7 +26,7 @@ const FIELD_MAX_CAPTURE_BYTES: FieldSchema = FieldSchema::new("maxCaptureBytes",
 const FIELD_JSON: FieldSchema = FieldSchema::new("json", SchemaType::Json)
     .documented("Legacy JSON payload. Prefer body; json and body are mutually exclusive.");
 const FIELD_BODY: FieldSchema = FieldSchema::new("body", SchemaType::Body).documented("Objects, arrays, numbers, booleans, and null are encoded as JSON; strings as UTF-8 text. Bytes and byte sources are sent unchanged. Use `mediaType` to select the encoding for ordinary values.");
-const FIELD_MEDIA_TYPE: FieldSchema = FieldSchema::new("mediaType", SchemaType::String).documented("Optional representation selection, mapped to Content-Type. Codec mediaType constants and concrete strings both work. A name does not register a custom processor.");
+const FIELD_MEDIA_TYPE: FieldSchema = FieldSchema::new("mediaType", SchemaType::String).documented("Optional representation selection, mapped to Content-Type. Codec mediaType constants and concrete strings both work. A custom processor must be explicitly registered with `use codec name` in this file; the mediaType constant alone does not activate it.");
 const FIELD_MAX_BODY_BYTES: FieldSchema = FieldSchema::new("maxBodyBytes", SchemaType::Integer)
     .documented(
         "Positive total outgoing payload bound; streamed source bounds and deadlines also apply.",
@@ -37,7 +37,7 @@ const FIELD_MAX_BODY_BYTES: FieldSchema = FieldSchema::new("maxBodyBytes", Schem
     });
 mettle_capability::result_object! {
     pub(crate) struct ResponseValue {
-        body => ("body", SchemaType::Value, "Decoded native response value. JSON/+json produces native values; text/* produces a UTF-8 string; missing/unknown content types produce bytes. HEAD/204/205/304 have null bodies. With stream: true, access acquires the complete bounded body and shares its capture with bodyBytes; cannot mix with chunks consumption. A media type does not prove application fields exist."),
+        body => ("body", SchemaType::Value, "Decoded native response value. An exact file-registered custom codec takes precedence; otherwise JSON/+json produces native values, text/* a UTF-8 string, and missing/unknown types bytes. HEAD/204/205/304 have null bodies. With stream: true, incremental codecs and text/event-stream produce a lazy single-consumer stream of native records; complete decoders acquire a bounded body shared with bodyBytes. Decoded streams and raw chunks compete for the same body. A media type does not prove application fields exist."),
         body_bytes => ("bodyBytes", SchemaType::Bytes, "Complete bounded response representation bytes. With stream: true, access acquires and caches the body; cannot mix with chunks consumption."),
         duration => ("duration", SchemaType::Duration, "Elapsed duration until the call returns: complete body normally, final response headers with stream: true."),
         headers => ("headers", SchemaType::StringMap, "Response headers; credential-bearing values retain sensitivity."),

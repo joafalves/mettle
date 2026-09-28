@@ -1,4 +1,4 @@
-//! Execution-owned blocking work and pull-based byte sources.
+//! Execution-owned blocking work and pull-based byte/value sources.
 
 use std::fmt;
 use std::future::Future;
@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::{CapabilityError, Span};
+use crate::{CapabilityError, Span, Value};
 
 pub const CHUNK_BYTES: usize = 64 * 1024;
 pub const DEFAULT_READ_BYTES: u64 = 10 * 1024 * 1024;
@@ -27,6 +27,50 @@ struct Resources {
     jobs: Mutex<Vec<Job>>,
     temporary: Mutex<Vec<PathBuf>>,
     owned: Mutex<Vec<Weak<dyn IoResource>>>,
+    codecs: Mutex<Vec<CodecBinding>>,
+}
+
+/// One registered processor with a complete or incremental decoder.
+pub trait ContentCodec: Send + Sync {
+    fn encode<'a>(
+        &'a self,
+        value: Value,
+        max_bytes: usize,
+        span: Span,
+        context: &'a IoContext,
+    ) -> crate::CapabilityFuture<'a>;
+    fn decode<'a>(
+        &'a self,
+        bytes: Value,
+        max_bytes: usize,
+        span: Span,
+        context: &'a IoContext,
+    ) -> crate::CapabilityFuture<'a>;
+
+    fn incremental(&self) -> bool {
+        false
+    }
+
+    fn decode_source<'a>(
+        &'a self,
+        _source: Value,
+        _max_bytes: usize,
+        span: Span,
+        _context: &'a IoContext,
+    ) -> crate::CapabilityFuture<'a> {
+        Box::pin(async move {
+            Err(CapabilityError::new(
+                "codec has no incremental decoder",
+                span,
+            ))
+        })
+    }
+}
+
+pub struct CodecBinding {
+    pub source: usize,
+    pub media_type: String,
+    pub codec: Arc<dyn ContentCodec>,
 }
 
 /// A live transfer owned by an entry, without retaining it in observations.
@@ -60,6 +104,7 @@ impl IoContext {
             jobs: Mutex::new(Vec::new()),
             temporary: Mutex::new(Vec::new()),
             owned: Mutex::new(Vec::new()),
+            codecs: Mutex::new(Vec::new()),
         }))
     }
 
@@ -164,6 +209,41 @@ impl IoContext {
         }
         resources.push(Arc::downgrade(resource));
         Ok(())
+    }
+
+    /// Install the entry's compile-validated, file-scoped codec bindings.
+    /// # Errors
+    /// A context may receive its bindings only once, before any work starts.
+    pub fn install_codecs(&self, bindings: Vec<CodecBinding>) -> Result<(), CapabilityError> {
+        let mut current = self
+            .0
+            .codecs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !current.is_empty() {
+            return Err(CapabilityError::new(
+                "codec registry is already installed",
+                Span::default(),
+            ));
+        }
+        *current = bindings;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn content_codec(
+        &self,
+        source: usize,
+        media: &crate::media_type::MediaType,
+    ) -> Option<Arc<dyn ContentCodec>> {
+        let name = media.normalized();
+        self.0
+            .codecs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|binding| binding.source == source && binding.media_type == name)
+            .map(|binding| binding.codec.clone())
     }
 
     /// Run filesystem work off the executor and retain ownership if its waiter drops.
@@ -329,6 +409,10 @@ pub type ChunkFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<Arc<[u8]>>, CapabilityError>> + Send + 'a>>;
 pub type ReaderFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Box<dyn ByteReader>, CapabilityError>> + Send + 'a>>;
+pub type ValueFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<Value>, CapabilityError>> + Send + 'a>>;
+pub type ValueReaderFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Box<dyn ValueReader>, CapabilityError>> + Send + 'a>>;
 
 pub trait ByteReader: Send {
     fn next_chunk(&mut self) -> ChunkFuture<'_>;
@@ -336,6 +420,61 @@ pub trait ByteReader: Send {
 
 pub trait SourceFactory: Send + Sync {
     fn open(&self, context: &IoContext) -> ReaderFuture<'_>;
+}
+
+pub trait ValueReader: Send {
+    fn next_value(&mut self) -> ValueFuture<'_>;
+}
+
+pub trait ValueSourceFactory: Send + Sync {
+    fn open(&self, context: &IoContext) -> ValueReaderFuture<'_>;
+}
+
+/// An owned stream of decoded values. It cannot be used as an outbound byte body.
+pub struct ValueSource {
+    claimed: AtomicBool,
+    factory: Box<dyn ValueSourceFactory>,
+    owner: IoContext,
+    pub span: Span,
+}
+
+impl ValueSource {
+    #[must_use]
+    pub fn new(factory: Box<dyn ValueSourceFactory>, span: Span, owner: &IoContext) -> Self {
+        Self {
+            claimed: AtomicBool::new(false),
+            factory,
+            owner: owner.clone(),
+            span,
+        }
+    }
+
+    /// # Errors
+    /// Returns an error if already consumed, owned by another entry, or acquisition fails.
+    pub async fn open(&self, context: &IoContext) -> Result<Box<dyn ValueReader>, CapabilityError> {
+        if !Arc::ptr_eq(&self.owner.0, &context.0) {
+            return Err(CapabilityError::new(
+                "value stream belongs to another execution",
+                self.span,
+            ));
+        }
+        self.claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| CapabilityError::new("value stream already consumed", self.span))?;
+        self.factory.open(context).await
+    }
+}
+
+impl fmt::Debug for ValueSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ValueSource(<opaque>)")
+    }
+}
+
+impl PartialEq for ValueSource {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
 }
 
 /// An opaque source whose aliases share one consumption claim.
@@ -357,6 +496,11 @@ impl ByteSource {
         }
     }
 
+    #[must_use]
+    pub fn from_bytes(bytes: Arc<[u8]>, span: Span, owner: &IoContext) -> Self {
+        Self::new(Box::new(MemoryFactory(bytes)), span, owner)
+    }
+
     /// # Errors
     /// Returns an error on repeated/concurrent consumption or acquisition failure.
     pub async fn open(&self, context: &IoContext) -> Result<Box<dyn ByteReader>, CapabilityError> {
@@ -375,6 +519,36 @@ impl ByteSource {
                 )
             })?;
         self.factory.open(context).await
+    }
+}
+
+struct MemoryFactory(Arc<[u8]>);
+
+impl SourceFactory for MemoryFactory {
+    fn open(&self, _: &IoContext) -> ReaderFuture<'_> {
+        let bytes = self.0.clone();
+        Box::pin(
+            async move { Ok(Box::new(MemoryReader { bytes, position: 0 }) as Box<dyn ByteReader>) },
+        )
+    }
+}
+
+struct MemoryReader {
+    bytes: Arc<[u8]>,
+    position: usize,
+}
+
+impl ByteReader for MemoryReader {
+    fn next_chunk(&mut self) -> ChunkFuture<'_> {
+        Box::pin(async move {
+            if self.position == self.bytes.len() {
+                return Ok(None);
+            }
+            let end = self.bytes.len().min(self.position + CHUNK_BYTES);
+            let chunk = Arc::from(&self.bytes[self.position..end]);
+            self.position = end;
+            Ok(Some(chunk))
+        })
     }
 }
 

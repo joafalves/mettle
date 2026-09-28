@@ -96,6 +96,19 @@
           }
         },
         {
+          "match": "\\b(codec)(\\s+)([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.mettle" },
+            "3": { "name": "entity.name.type.codec.mettle" }
+          }
+        },
+        {
+          "match": "\\b(encode|decode)(?=\\s*\\()",
+          "captures": {
+            "1": { "name": "entity.name.function.mettle" }
+          }
+        },
+        {
           "match": "\\b(namespace)(\\s+)([A-Za-z_][A-Za-z0-9_.]*)",
           "captures": {
             "1": { "name": "storage.type.namespace.mettle" },
@@ -107,7 +120,7 @@
     "directives": {
       "patterns": [
         {
-          "match": "\\b(use)(\\s+)(context|namespace)\\b",
+          "match": "\\b(use)(\\s+)(context|namespace|codec)\\b",
           "captures": {
             "1": { "name": "keyword.control.import.mettle" },
             "3": { "name": "storage.type.mettle" }
@@ -137,7 +150,7 @@
         },
         {
           "name": "keyword.control.mettle",
-          "match": "\\bsource(?=\\s*\\{)"
+          "match": "\\b(source|stream)(?=\\s*\\{)"
         },
         {
           "name": "keyword.operator.logical.mettle",

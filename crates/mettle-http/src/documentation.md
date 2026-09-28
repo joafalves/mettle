@@ -1,9 +1,10 @@
 No request is performed when opening this reference. On methods accepting a body,
 an omitted body is different from JSON null.
 `mediaType` or a `Content-Type` header selects an encoder for ordinary values.
-JSON and `+json` use generic JSON processing; `text/*` uses UTF-8 text. Unknown
-representations require already encoded bytes or a source. Media-type names alone
-do not define a domain schema or install a processor.
+An exact custom codec registered with `use codec name` in the calling file takes
+precedence. Otherwise JSON and `+json` use generic JSON processing, `text/*`
+uses UTF-8 text, and unknown representations require already encoded bytes or a
+source. Media-type names alone do not define a domain schema or install a processor.
 
 Bytes and sources are never encoded again. `body: json.encode(value)` sends the
 encoded bytes unchanged; use `mediaType: json.mediaType` to label them. For another
@@ -21,7 +22,8 @@ Cancellation stops owned work; sources are never automatically replayed. An
 explicit retry must create a new source on each attempt, and can duplicate remote
 side effects.
 
-Incoming `.body` is decoded into native values: JSON/`+json` produces an object,
+Incoming `.body` is decoded into native values: an exact registered codec runs
+first; otherwise JSON/`+json` produces an object,
 array, scalar, or null; `text/*` produces a strict UTF-8 string; missing/unknown
 content types produce bytes, without sniffing. `.bodyBytes` retains bounded
 representation bytes. `.mediaType` is the normalized Content-Type string with
@@ -37,5 +39,11 @@ decompression is not implemented. Error HTTP statuses still return normally
 when their metadata/content are valid.
 
 Response `.json` is removed: use `.body` for decoded values or explicitly decode
-`.bodyBytes`. HTTP/2, compression, live response iteration, and user codecs remain
-future work. Variable/field inference and richer hovers are the separate phase 3.5.
+`.bodyBytes`. Custom codecs require explicit file-level registration. Their
+`decode` method returns either one value from complete bytes or a value stream
+from an owned byte source. With `stream: true`, an incremental decoder feeds
+`.body` lazily; ordinary buffered calls collect a bounded array. `response.chunks`
+remains raw and competes for the same one-consumer body. Built-in SSE decoding
+also exposes events through streamed `.body`, without automatic reconnection.
+Complete conversion is bounded to 10 MiB and 30 seconds. HTTP/2 and compression
+remain future work.

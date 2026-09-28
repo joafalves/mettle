@@ -13,6 +13,7 @@ Basic language support for `.mettle` source files.
   reusable and anonymous file contexts, `senv()`, `echo()`, conditionals, assertion messages, loops, named parallel branches, structured and load execution
   policies, and HTTP requests using named `body`;
 - snippets for complete filesystem reads, incremental copies, streamed HTTP downloads/uploads, and lazy `source`/`yield` producers;
+- `codec`/`use codec` snippets for complete and incremental decoders, with highlighting for `stream` value producers and conversion methods;
 - highlighting and compiler-backed references for `source`, `yield`, and loop `break`;
 - highlighting for built-in `is`/`as` kind operations and snippets for codecs/media types;
 - compiler-backed **Run Flow** CodeLens actions above every named and anonymous flow;
@@ -67,6 +68,12 @@ filesystem and codec descriptions explain buffering, consumption, and decoding r
 selector and bound descriptions. Match fields come from the same Rust record that
 constructs runtime results. HTTP `stream`/`maxCaptureBytes` and streamed response
 `chunks`/`close` are documented in the registered schema, not in editor-only data.
+Declared codecs have Go to Definition from `use codec name` and
+`name.mediaType`, plus a hover showing the canonical media type, aliases, and
+file-level activation rule. Codec method bodies still use ordinary native-value
+hovers. Registered codecs can also be called directly as `name.encode(value)`
+and `name.decode(bytes)` for complete values; no separate editor codec registry
+is maintained.
 
 HTTP response references describe decoded native `.body` values and normalized
 `.mediaType`; `.bodyBytes` retains the representation bytes. The old response

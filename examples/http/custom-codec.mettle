@@ -1,0 +1,61 @@
+// Start the local fixture: python3 util/test-server/http_fixture.py --port 8080
+// Then run: mettle run examples/http/custom-codec.mettle
+// A declaration alone is inert; use codec registers it for calls in this file.
+
+codec temperature {
+    mediaType: "application/vnd.example.temperature"
+    aliases: ["application/x-temperature"]
+
+    encode(value) {
+        if (value is number) {
+            return text.encode(value as string)
+        }
+        assert(value is object, "Expected a number or object")
+        assert(value.celsius is number, "Expected numeric celsius")
+        text.encode(value.celsius as string)
+    }
+
+    decode(bytes) {
+        { celsius: text.decode(bytes) as number }
+    }
+}
+
+use codec temperature
+
+use context {
+    defaults http {
+        baseUrl: "http://127.0.0.1:8080"
+        headers: { Authorization: "Bearer local-test-token" }
+    }
+}
+
+flow main {
+    complete = temperature.decode(temperature.encode({ celsius: 22 }))
+    assert(complete.celsius == 22)
+
+    response = http.get("/content/temperature")
+    assert(response.status == 200)
+    assert(response.body.celsius == 23)
+    assert(response.mediaType == temperature.mediaType)
+
+    sent = http.post("/method", body: { celsius: 24 }, mediaType: temperature.mediaType)
+    assert(sent.status == 200)
+    assert(sent.body.body == "24")
+    assert(sent.body.contentType == temperature.mediaType)
+    { local: complete, received: response.body, sent: sent.body.body }
+}
+
+test "numeric input also encodes" {
+    response = http.post("/method", body: 25, mediaType: temperature.mediaType)
+    assert(response.body.body == "25")
+}
+
+test "registered alias decodes" {
+    response = http.get("/content/temperature-alias")
+    assert(response.body.celsius == 23)
+}
+
+flow streaming {
+    response = http.get("/content/temperature", stream: true)
+    response.body
+}

@@ -66,6 +66,15 @@ indefinitely.
   `close()`/entry cleanup prompt and idempotent. Observation, CLI reports, and LSP
   must snapshot metadata without acquiring or retaining live body handles. A
   final execution result cannot contain live responses or sources.
+- User codec declarations are inert until explicit file-level `use codec`
+  registration. Resolve names and duplicate media claims at compile time; use
+  exact normalized media-type matches before generic built-in fallbacks. Keep
+  conversion bodies pure, bounded, entry-owned, and source-aware. Encode returns
+  bytes. Decode either returns one native value from complete bytes, or returns
+  `stream { ... yield value ... }` from a byte source; do not add separate
+  chunk/EOF callback methods. Streamed HTTP consumes values lazily, while buffered
+  and direct calls collect a bounded array. Do not execute I/O named by a
+  response header. Preserve project-file isolation and editor navigation.
 - Preserve sensitive-value metadata and redaction through transformations,
   diagnostics, reports, and editor output. Never commit real credentials; checked-in
   environment examples and TLS material are local fixtures only.

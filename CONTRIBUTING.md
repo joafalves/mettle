@@ -96,6 +96,8 @@ python3 scripts/acceptance-portable.py
 python3 scripts/acceptance-filesystem.py
 python3 scripts/acceptance-content.py
 python3 scripts/acceptance-streaming.py
+python3 scripts/acceptance-codec.py
+python3 scripts/acceptance-incremental.py
 ```
 
 GitHub Actions runs workspace tests, Clippy, and portable HTTP/load acceptance on

@@ -371,6 +371,8 @@ pub fn recover(source: &str) -> Program {
             namespace_uses: Vec::new(),
             contexts: Vec::new(),
             file_contexts: Vec::new(),
+            codecs: Vec::new(),
+            codec_uses: Vec::new(),
             flows: Vec::new(),
         })
 }

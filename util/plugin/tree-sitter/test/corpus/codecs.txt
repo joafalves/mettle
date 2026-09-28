@@ -1,0 +1,58 @@
+================================================================================
+Complete-value codec and explicit file registration
+================================================================================
+
+codec temperature {
+    mediaType: "application/vnd.example.temperature"
+    aliases: ["application/x-temperature"]
+    encode(value) { text.encode(value as string) }
+    decode(bytes) { text.decode(bytes) as number }
+}
+use codec temperature
+flow main = temperature.mediaType
+
+---
+
+(source_file
+  (codec_declaration
+    (identifier)
+    (codec_body
+      (codec_media_type
+        (identifier)
+        (string
+          (string_content)))
+      (codec_aliases
+        (identifier)
+        (string
+          (string_content)))
+      (codec_method
+        (identifier)
+        (block
+          (expression_statement
+            (call_expression
+              (member_expression
+                (identifier)
+                (identifier))
+              (argument_list
+                (type_operation
+                  (identifier)
+                  (value_kind)))))))
+      (codec_method
+        (identifier)
+        (block
+          (expression_statement
+            (type_operation
+              (call_expression
+                (member_expression
+                  (identifier)
+                  (identifier))
+                (argument_list
+                  (identifier)))
+              (value_kind)))))))
+  (codec_use
+    (identifier))
+  (flow_declaration
+    (identifier)
+    (member_expression
+      (identifier)
+      (identifier))))

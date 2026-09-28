@@ -108,6 +108,10 @@
           "named": true
         },
         {
+          "type": "stream_expression",
+          "named": true
+        },
+        {
           "type": "string",
           "named": true
         },
@@ -215,6 +219,10 @@
           "named": true
         },
         {
+          "type": "stream_expression",
+          "named": true
+        },
+        {
           "type": "string",
           "named": true
         },
@@ -319,6 +327,10 @@
         },
         {
           "type": "source_expression",
+          "named": true
+        },
+        {
+          "type": "stream_expression",
           "named": true
         },
         {
@@ -440,6 +452,10 @@
           "named": true
         },
         {
+          "type": "stream_expression",
+          "named": true
+        },
+        {
           "type": "string",
           "named": true
         },
@@ -544,6 +560,10 @@
           },
           {
             "type": "source_expression",
+            "named": true
+          },
+          {
+            "type": "stream_expression",
             "named": true
           },
           {
@@ -687,6 +707,10 @@
             "named": true
           },
           {
+            "type": "stream_expression",
+            "named": true
+          },
+          {
             "type": "string",
             "named": true
           },
@@ -805,6 +829,10 @@
             "named": true
           },
           {
+            "type": "stream_expression",
+            "named": true
+          },
+          {
             "type": "string",
             "named": true
           },
@@ -919,6 +947,163 @@
           "named": true
         }
       ]
+    }
+  },
+  {
+    "type": "codec_aliases",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "string",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "codec_body",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "codec_aliases",
+          "named": true
+        },
+        {
+          "type": "codec_media_type",
+          "named": true
+        },
+        {
+          "type": "codec_method",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "codec_declaration",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "codec_body",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "codec_media_type",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      },
+      "value": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "string",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "codec_method",
+    "named": true,
+    "fields": {
+      "body": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "block",
+            "named": true
+          }
+        ]
+      },
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "decode",
+            "named": false
+          },
+          {
+            "type": "encode",
+            "named": false
+          }
+        ]
+      },
+      "parameter": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "codec_use",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      }
     }
   },
   {
@@ -1135,6 +1320,10 @@
           "named": true
         },
         {
+          "type": "stream_expression",
+          "named": true
+        },
+        {
           "type": "string",
           "named": true
         },
@@ -1250,6 +1439,10 @@
         },
         {
           "type": "source_expression",
+          "named": true
+        },
+        {
+          "type": "stream_expression",
           "named": true
         },
         {
@@ -1403,6 +1596,10 @@
           "named": true
         },
         {
+          "type": "stream_expression",
+          "named": true
+        },
+        {
           "type": "string",
           "named": true
         },
@@ -1507,6 +1704,10 @@
         },
         {
           "type": "source_expression",
+          "named": true
+        },
+        {
+          "type": "stream_expression",
           "named": true
         },
         {
@@ -1647,6 +1848,10 @@
             "named": true
           },
           {
+            "type": "stream_expression",
+            "named": true
+          },
+          {
             "type": "string",
             "named": true
           },
@@ -1782,6 +1987,10 @@
           },
           {
             "type": "source_expression",
+            "named": true
+          },
+          {
+            "type": "stream_expression",
             "named": true
           },
           {
@@ -1932,6 +2141,10 @@
             "named": true
           },
           {
+            "type": "stream_expression",
+            "named": true
+          },
+          {
             "type": "string",
             "named": true
           },
@@ -2050,6 +2263,10 @@
             "named": true
           },
           {
+            "type": "stream_expression",
+            "named": true
+          },
+          {
             "type": "string",
             "named": true
           },
@@ -2145,6 +2362,10 @@
           },
           {
             "type": "source_expression",
+            "named": true
+          },
+          {
+            "type": "stream_expression",
             "named": true
           },
           {
@@ -2278,6 +2499,10 @@
           "named": true
         },
         {
+          "type": "stream_expression",
+          "named": true
+        },
+        {
           "type": "string",
           "named": true
         },
@@ -2378,6 +2603,10 @@
           },
           {
             "type": "source_expression",
+            "named": true
+          },
+          {
+            "type": "stream_expression",
             "named": true
           },
           {
@@ -2505,6 +2734,10 @@
             "named": true
           },
           {
+            "type": "stream_expression",
+            "named": true
+          },
+          {
             "type": "string",
             "named": true
           },
@@ -2620,6 +2853,10 @@
           },
           {
             "type": "source_expression",
+            "named": true
+          },
+          {
+            "type": "stream_expression",
             "named": true
           },
           {
@@ -2797,6 +3034,10 @@
             "named": true
           },
           {
+            "type": "stream_expression",
+            "named": true
+          },
+          {
             "type": "string",
             "named": true
           },
@@ -2906,6 +3147,10 @@
         },
         {
           "type": "source_expression",
+          "named": true
+        },
+        {
+          "type": "stream_expression",
           "named": true
         },
         {
@@ -3050,6 +3295,10 @@
           "named": true
         },
         {
+          "type": "stream_expression",
+          "named": true
+        },
+        {
           "type": "string",
           "named": true
         },
@@ -3165,6 +3414,10 @@
         },
         {
           "type": "source_expression",
+          "named": true
+        },
+        {
+          "type": "stream_expression",
           "named": true
         },
         {
@@ -3329,6 +3582,10 @@
           "named": true
         },
         {
+          "type": "stream_expression",
+          "named": true
+        },
+        {
           "type": "string",
           "named": true
         },
@@ -3380,6 +3637,14 @@
           "named": true
         },
         {
+          "type": "codec_declaration",
+          "named": true
+        },
+        {
+          "type": "codec_use",
+          "named": true
+        },
+        {
           "type": "context_declaration",
           "named": true
         },
@@ -3401,6 +3666,21 @@
         },
         {
           "type": "test_declaration",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "stream_expression",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "block",
           "named": true
         }
       ]
@@ -3526,6 +3806,10 @@
         },
         {
           "type": "source_expression",
+          "named": true
+        },
+        {
+          "type": "stream_expression",
           "named": true
         },
         {
@@ -3673,6 +3957,10 @@
           "named": true
         },
         {
+          "type": "stream_expression",
+          "named": true
+        },
+        {
           "type": "string",
           "named": true
         },
@@ -3800,6 +4088,10 @@
             "named": true
           },
           {
+            "type": "stream_expression",
+            "named": true
+          },
+          {
             "type": "string",
             "named": true
           },
@@ -3897,6 +4189,10 @@
         },
         {
           "type": "source_expression",
+          "named": true
+        },
+        {
+          "type": "stream_expression",
           "named": true
         },
         {
@@ -4031,6 +4327,10 @@
           "named": true
         },
         {
+          "type": "stream_expression",
+          "named": true
+        },
+        {
           "type": "string",
           "named": true
         },
@@ -4146,6 +4446,10 @@
     "named": false
   },
   {
+    "type": "codec",
+    "named": false
+  },
+  {
     "type": "comment",
     "named": true,
     "extra": true
@@ -4156,6 +4460,10 @@
   },
   {
     "type": "context",
+    "named": false
+  },
+  {
+    "type": "decode",
     "named": false
   },
   {
@@ -4172,6 +4480,10 @@
   },
   {
     "type": "else",
+    "named": false
+  },
+  {
+    "type": "encode",
     "named": false
   },
   {
@@ -4264,6 +4576,10 @@
   },
   {
     "type": "source",
+    "named": false
+  },
+  {
+    "type": "stream",
     "named": false
   },
   {

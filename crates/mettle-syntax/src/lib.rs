@@ -49,6 +49,8 @@ pub struct Program {
     pub namespace_uses: Vec<Spanned<String>>,
     pub contexts: Vec<ContextDecl>,
     pub file_contexts: Vec<FileContextUse>,
+    pub codecs: Vec<CodecDecl>,
+    pub codec_uses: Vec<CodecUse>,
     pub flows: Vec<MettleDecl>,
 }
 
@@ -96,6 +98,17 @@ impl Program {
                 FileContextUse::Inline(span) => *span = span.with_source(source),
             }
         }
+        for codec in &mut self.codecs {
+            codec.span = codec.span.with_source(source);
+            codec.name.span = codec.name.span.with_source(source);
+            codec.media_type.span = codec.media_type.span.with_source(source);
+            for alias in &mut codec.aliases {
+                alias.span = alias.span.with_source(source);
+            }
+        }
+        for codec in &mut self.codec_uses {
+            codec.name.span = codec.name.span.with_source(source);
+        }
         for flow in &mut self.flows {
             flow.span = flow.span.with_source(source);
             if let Some(name) = &mut flow.name {
@@ -112,6 +125,40 @@ impl Program {
             }
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CodecDecl {
+    pub namespace: String,
+    pub name: Spanned<String>,
+    pub media_type: Spanned<String>,
+    pub aliases: Vec<Spanned<String>>,
+    pub encode_flow: usize,
+    pub decode_flow: usize,
+    pub span: Span,
+}
+
+impl CodecDecl {
+    /// Whether the decoder produces native records from a byte source.
+    #[must_use]
+    pub fn is_incremental(&self, program: &Program) -> bool {
+        program.flows[self.decode_flow]
+            .body
+            .last()
+            .is_some_and(|statement| {
+                matches!(statement,
+                    Statement::Expression(expression) | Statement::Return { expression, .. }
+                    if matches!(expression.kind, ExpressionKind::ValueStream(_))
+                )
+            })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CodecUse {
+    pub namespace: String,
+    pub namespace_uses: Vec<Spanned<String>>,
+    pub name: Spanned<String>,
 }
 
 fn set_statement_source(statement: &mut Statement, source: usize) {
@@ -182,7 +229,9 @@ fn set_expression_source(expression: &mut Expression, source: usize) {
                 set_field_source(field, source);
             }
         }
-        ExpressionKind::Block(statements) | ExpressionKind::Source(statements) => {
+        ExpressionKind::Block(statements)
+        | ExpressionKind::Source(statements)
+        | ExpressionKind::ValueStream(statements) => {
             for statement in statements {
                 set_statement_source(statement, source);
             }
@@ -361,6 +410,7 @@ pub struct MettleDecl {
 pub enum DeclarationKind {
     Flow,
     Test,
+    Codec,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -444,6 +494,7 @@ pub enum ExpressionKind {
     Object(Vec<ObjectField>),
     Block(Vec<Statement>),
     Source(Vec<Statement>),
+    ValueStream(Vec<Statement>),
     Fail(Box<Expression>),
     For {
         key: Option<Spanned<String>>,
@@ -609,6 +660,7 @@ enum TokenKind {
     Mettle,
     Test,
     Context,
+    Codec,
     Namespace,
     Defaults,
     Use,
