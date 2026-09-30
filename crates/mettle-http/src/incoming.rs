@@ -1,10 +1,13 @@
 //! Bounded response representation selection and native-value decoding.
 
+use flate2::read::GzDecoder;
 use hyper::header::{CONTENT_ENCODING, CONTENT_TYPE};
 use hyper::{HeaderMap, Method};
 use mettle_capability::content::BuiltinCodec;
 use mettle_capability::media_type::MediaType;
 use mettle_capability::{CapabilityError, Span, Value};
+use std::io::{self, Read};
+use std::sync::Arc;
 
 pub fn bodyless(method: &Method, status: u16) -> bool {
     *method == Method::HEAD || matches!(status, 204 | 205 | 304)
@@ -47,20 +50,54 @@ pub fn decode(
             Value::Null
         });
     }
+
+    let mut encodings = Vec::new();
     for encoding in headers.get_all(CONTENT_ENCODING) {
         let encoding = encoding
             .to_str()
             .map_err(|_| CapabilityError::new("invalid HTTP response Content-Encoding", span))?;
-        if !encoding
-            .split(',')
-            .all(|part| part.trim().eq_ignore_ascii_case("identity"))
-        {
+        for part in encoding.split(',') {
+            let literal = part.trim().to_ascii_lowercase();
+            if literal.is_empty() {
+                continue;
+            }
+            encodings.push(literal);
+        }
+    }
+
+    let is_sensitive = bytes.contains_sensitive();
+    let mut buf: Arc<[u8]> = match bytes.revealed() {
+        Value::Bytes(b) => b.clone(),
+        _ => {
             return Err(CapabilityError::new(
-                "unsupported HTTP response Content-Encoding; automatic decompression is not implemented",
+                "HTTP response needs to be bytes before decoding",
                 span,
             ));
         }
+    };
+
+    for encoding in encodings.iter().rev() {
+        match encoding.as_str() {
+            "identity" => {
+                // no-op
+            }
+            "gzip" | "x-gzip" => {
+                buf = decode_gzip(&buf, max_bytes, span)?;
+            }
+            other => {
+                return Err(CapabilityError::new(
+                    format!("Unsupported HTTP response Content-Encoding: {other}"),
+                    span,
+                ));
+            }
+        }
     }
+
+    let bytes = if is_sensitive {
+        Value::Bytes(buf).sensitive()
+    } else {
+        Value::Bytes(buf)
+    };
     if let Some(media) = media {
         media.validate_encoding(span).map_err(|_| {
             CapabilityError::new(
@@ -71,7 +108,7 @@ pub fn decode(
     }
     media
         .map_or(BuiltinCodec::Bytes, MediaType::codec)
-        .decode(bytes, max_bytes, span)
+        .decode(&bytes, max_bytes, span)
         .map_err(|error| {
             CapabilityError::new(
                 format!("HTTP response body could not be decoded: {}", error.message),
@@ -80,11 +117,57 @@ pub fn decode(
         })
 }
 
+fn decode_gzip(
+    bytes: &Arc<[u8]>,
+    max_bytes: usize,
+    span: Span,
+) -> Result<Arc<[u8]>, CapabilityError> {
+    let mut decoder = GzDecoder::new(&bytes[..]);
+    let mut result = Vec::with_capacity(bytes.len().min(max_bytes));
+    loop {
+        let mut chunk = [0u8; 8 * 1024];
+        let n = decoder.read(&mut chunk).map_err(|e| {
+            let kind = e.kind();
+            let msg = match kind {
+                io::ErrorKind::UnexpectedEof => "gzip stream ended unexpectedly",
+                io::ErrorKind::InvalidData => "invalid gzip data",
+                _ => "gzip decompression failed",
+            };
+            CapabilityError::new(format!("{msg}: {e}"), span)
+        })?;
+
+        if n == 0 {
+            // EOF
+            break;
+        }
+
+        if result.len() + n > max_bytes {
+            return Err(CapabilityError::new(
+                format!("decompressed HTTP response exceeded the {max_bytes} byte limit"),
+                span,
+            ));
+        }
+
+        result.extend_from_slice(&chunk[..n]);
+    }
+
+    Ok(result.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
     use hyper::header::HeaderValue;
+    use std::io::Write;
     use std::sync::Arc;
+
+    fn gzip(input: &[u8]) -> Arc<[u8]> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(input).unwrap();
+        encoder.finish().unwrap().into()
+    }
 
     fn decoded(content_type: Option<&str>, input: &[u8]) -> Result<Value, CapabilityError> {
         let mut headers = HeaderMap::new();
@@ -101,6 +184,138 @@ mod tests {
             1024,
             span,
         )
+    }
+
+    fn decoded_content_encoding(
+        content_encoding: Option<&str>,
+        input: &[u8],
+    ) -> Result<Value, CapabilityError> {
+        let mut headers = HeaderMap::new();
+        if let Some(content_encoding) = content_encoding {
+            headers.insert(
+                CONTENT_ENCODING,
+                HeaderValue::from_str(content_encoding).unwrap(),
+            );
+        }
+        let span = Span::new(10, 20);
+        decode(
+            &Value::Bytes(Arc::from(input)),
+            representation(&headers, span)?.as_ref(),
+            &headers,
+            false,
+            1024,
+            span,
+        )
+    }
+
+    #[test]
+    fn content_encoding_verification() {
+        let hello = Value::Bytes(Arc::from(b"hello".as_slice()));
+        let gzipped = gzip(b"hello");
+        assert!(decoded_content_encoding(None, b"hello").is_ok());
+        assert!(decoded_content_encoding(Some("identity"), b"hello").is_ok());
+        assert!(decoded_content_encoding(Some("Identity"), b"hello").is_ok());
+        assert!(decoded_content_encoding(Some("identity, identity"), b"hello").is_ok());
+        assert_eq!(
+            decoded_content_encoding(Some("gzip"), &gzipped).unwrap(),
+            hello
+        );
+        assert_eq!(
+            decoded_content_encoding(Some("identity, gzip"), &gzipped).unwrap(),
+            hello
+        );
+        assert!(decoded_content_encoding(Some("gzip"), b"hello").is_err());
+        assert!(decoded_content_encoding(Some("br"), b"hello").is_err());
+        assert!(decoded_content_encoding(Some("gzip, br"), &gzipped).is_err());
+    }
+
+    #[test]
+    fn bodyless_responses_ignore_content_encoding() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("br"));
+        assert_eq!(
+            decode(
+                &Value::Bytes(Arc::from(b"".as_slice())),
+                None,
+                &headers,
+                true,
+                1024,
+                Span::default(),
+            )
+            .unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn gzip_content_exceeds_max_bytes_limit() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        let input = gzip(br#"{"name":"Ada"}"#);
+        let span = Span::new(10, 20);
+
+        assert!(
+            decode(
+                &Value::Bytes(input),
+                representation(&headers, span).unwrap().as_ref(),
+                &headers,
+                false,
+                5,
+                span,
+            )
+            .unwrap_err()
+            .message
+            .contains("decompressed HTTP response exceeded the 5 byte limit")
+        );
+    }
+
+    #[test]
+    fn gzip_content_is_decoded_before_its_media_type() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        let input = gzip(br#"{"name":"Ada"}"#);
+        let span = Span::new(10, 20);
+
+        assert_eq!(
+            decode(
+                &Value::Bytes(input),
+                representation(&headers, span).unwrap().as_ref(),
+                &headers,
+                false,
+                1024,
+                span,
+            )
+            .unwrap(),
+            Value::Object(
+                [("name".into(), Value::String("Ada".into()))]
+                    .into_iter()
+                    .collect()
+            )
+        );
+    }
+
+    #[test]
+    fn gzip_content_preserves_sensitivity_and_decoded_bounds() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("x-gzip"));
+        let input = gzip(b"private response");
+        let span = Span::new(10, 20);
+
+        assert_eq!(
+            decode(
+                &Value::Bytes(input.clone()).sensitive(),
+                representation(&headers, span).unwrap().as_ref(),
+                &headers,
+                false,
+                1024,
+                span,
+            )
+            .unwrap(),
+            Value::String("private response".into()).sensitive()
+        );
     }
 
     #[test]
@@ -172,7 +387,7 @@ mod tests {
             decode(&bytes, None, &headers, false, 10, Span::default())
                 .unwrap_err()
                 .message
-                .contains("Content-Encoding")
+                .contains("gzip")
         );
     }
 

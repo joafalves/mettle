@@ -270,17 +270,21 @@ mettle run examples/http/workflow.mettle
 An HTTP response exposes `status`, `headers`, `body`, `bodyBytes`, `mediaType`, `method`, `url`, and `duration`. `body` is the decoded native value, not necessarily an object. `mediaType` is the normalized Content-Type string with explicit parameters, or `null` when absent. HTTP status codes are ordinary values, so assertions make the expected condition obvious. Header names containing punctuation use string-key access, such as `response.headers["content-type"]`.
 
 Incoming JSON and `+json` decode into native objects, arrays, strings, numbers,
-booleans, or null. `text/*` decodes into a strict UTF-8 string. Missing or unknown
-content types remain bytes, without content sniffing. `bodyBytes` always retains
-the bounded representation bytes; the original Content-Type stays in `headers`.
-JSON is a representation, not a language value kind or a guarantee that fields exist.
+booleans, or null. `text/*` decodes into a strict UTF-8 string. `gzip` and
+`x-gzip` responses are decompressed before their media type is decoded. Missing or
+unknown content types remain bytes, without content sniffing. `bodyBytes` always
+retains the bounded received representation bytes; the original Content-Type stays
+in `headers`, so gzip responses keep their compressed bytes there. Mettle does not
+send `Accept-Encoding`; add `Accept-Encoding: gzip` to the request headers when a
+server should compress. JSON is a representation, not a language value kind or a
+guarantee that fields exist.
 
 HEAD and statuses 204/205/304 have `body: null`. Other empty text/binary bodies
 remain `""`/empty bytes; empty declared JSON fails. Malformed or duplicate
-Content-Type, invalid JSON/UTF-8, unsupported JSON/text charsets, excessive
-nesting/numbers, and response limits fail with useful source locations. Non-identity
-Content-Encoding is rejected for responses with a body; compression is separate
-future work. HTTP error statuses are returned when their content is valid.
+Content-Type, invalid JSON/UTF-8 or gzip data, unsupported JSON/text charsets,
+excessive nesting/numbers, unsupported content encodings, and response limits fail
+with useful source locations. HTTP error statuses are returned when their content
+is valid.
 
 **Breaking response migration:** `.json` has been removed; replace
 `response.json.name` with `response.body.name`. To obtain text independently of
@@ -717,7 +721,8 @@ ordinary result explicitly when it should be displayed. Try the
 body kinds, metadata, bodyless responses, and explicit raw-byte decoding.
 
 Incoming `.body` values use the built-in decoders today. User-defined codecs,
-compression, scoped exchanges, and live response iteration are later work;
+content encodings other than gzip, scoped exchanges, and live response iteration
+are later work;
 raw `.bodyBytes` remain explicitly available.
 
 ### Capability interfaces
@@ -854,7 +859,9 @@ streaming; `maxCaptureBytes` separately bounds complete memory acquisition.
 The HTTP `timeout` starts at request creation and remains effective through body
 consumption. Sink/source deadlines can impose tighter limits. Raw chunks preserve
 the transmitted representation; no implicit decompression or record decoding
-occurs. Complete decoded capture still validates encoding and representation.
+occurs. A complete capture's `.body` still removes gzip Content-Encoding and
+validates the representation, with decompressed output bounded by
+`maxCaptureBytes`; its `.bodyBytes` remain the received bytes.
 
 Call `response.close()` when the body is unwanted. It is idempotent and abandons
 the body, not a promise to close the physical pooled connection. Entry completion,
