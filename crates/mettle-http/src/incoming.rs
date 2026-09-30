@@ -103,6 +103,54 @@ mod tests {
         )
     }
 
+    fn decoded_content_encoding(content_encoding: Option<&str>) -> Result<Value, CapabilityError> {
+        let mut headers = HeaderMap::new();
+        if let Some(content_encoding) = content_encoding {
+            headers.insert(
+                CONTENT_ENCODING,
+                HeaderValue::from_str(content_encoding).unwrap(),
+            );
+        }
+        let span = Span::new(10, 20);
+        decode(
+            &Value::Bytes(Arc::from(b"hello".as_slice())),
+            representation(&headers, span)?.as_ref(),
+            &headers,
+            false,
+            1024,
+            span,
+        )
+    }
+
+    #[test]
+    fn content_encoding_verification() {
+        assert!(decoded_content_encoding(None).is_ok());
+        assert!(decoded_content_encoding(Some("identity")).is_ok());
+        assert!(decoded_content_encoding(Some("Identity")).is_ok());
+        assert!(decoded_content_encoding(Some("gzip")).is_err());
+        assert!(decoded_content_encoding(Some("br")).is_err());
+        assert!(decoded_content_encoding(Some("identity, gzip")).is_err());
+        assert!(decoded_content_encoding(Some("identity, identity")).is_ok());
+    }
+
+    #[test]
+    fn bodyless_responses_ignore_content_encoding() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("br"));
+        assert_eq!(
+            decode(
+                &Value::Bytes(Arc::from(b"".as_slice())),
+                None,
+                &headers,
+                true,
+                1024,
+                Span::default(),
+            )
+            .unwrap(),
+            Value::Null
+        );
+    }
+
     #[test]
     fn decoding_uses_native_kinds_and_never_sniffs_unknown_content() {
         for (input, expected) in [
