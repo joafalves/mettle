@@ -104,7 +104,7 @@ the repository checkout:
 ```bash
 cd util/plugin/vscode
 npm run package
-code --install-extension dist/mettle-language-1.0.0-alpha.1.vsix --force
+code --install-extension dist/mettle-language-1.0.0-alpha.3.vsix --force
 ```
 
 If the `code` launcher is unavailable, in VS Code open the Extensions view,
@@ -1235,7 +1235,7 @@ The included extension provides `.mettle` recognition, syntax highlighting, snip
 ```bash
 cd util/plugin/vscode
 npm run package
-code --install-extension dist/mettle-language-1.0.0-alpha.1.vsix --force
+code --install-extension dist/mettle-language-1.0.0-alpha.3.vsix --force
 ```
 
 The extension looks for `mettle` on `PATH`. Set **Mettle: Executable Path** if the binary lives elsewhere. With a `.mettle` file open, click **Mettle profile: Default** (or the current profile) in the bottom status bar, use the gear icon in the editor title bar, or run **Mettle: Select Profile** from the Command Palette. The picker discovers `.env` and `.env.<name>` files for the active file; **Default** uses `.env` and no `--profile` flag. The selection is remembered per project or standalone-file directory and is passed to Run Flow, Run All, and Run Tests actions. Read [`util/plugin/vscode/README.md`](util/plugin/vscode/README.md) for installation details.

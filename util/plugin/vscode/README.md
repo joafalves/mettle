@@ -196,7 +196,7 @@ Packaging uses the pinned official Microsoft `@vscode/vsce` 4.0.0 tool. It is do
 The resulting package is:
 
 ```text
-dist/mettle-language-1.0.0-alpha.1.vsix
+dist/mettle-language-1.0.0-alpha.3.vsix
 ```
 
 ## Install
@@ -204,7 +204,7 @@ dist/mettle-language-1.0.0-alpha.1.vsix
 Install or update from the command line:
 
 ```bash
-code --install-extension dist/mettle-language-1.0.0-alpha.1.vsix --force
+code --install-extension dist/mettle-language-1.0.0-alpha.3.vsix --force
 ```
 
 Alternatively, open the Extensions view, choose **Install from VSIX…**, and select the package from `dist/`.

@@ -235,7 +235,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "mettle-capability"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 dependencies = [
  "mettle-syntax",
  "regex",
@@ -246,7 +246,7 @@ dependencies = [
 
 [[package]]
 name = "mettle-cli"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 dependencies = [
  "mettle-capability",
  "mettle-compiler",
@@ -262,7 +262,7 @@ dependencies = [
 
 [[package]]
 name = "mettle-compiler"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 dependencies = [
  "mettle-capability",
  "mettle-syntax",
@@ -270,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "mettle-fs"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 dependencies = [
  "libc",
  "mettle-capability",
@@ -279,7 +279,7 @@ dependencies = [
 
 [[package]]
 name = "mettle-http"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 dependencies = [
  "bytes",
  "http-body-util",
@@ -294,7 +294,7 @@ dependencies = [
 
 [[package]]
 name = "mettle-runtime"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 dependencies = [
  "mettle-capability",
  "mettle-compiler",
@@ -304,7 +304,7 @@ dependencies = [
 
 [[package]]
 name = "mettle-syntax"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.3"
 
 [[package]]
 name = "mio"
