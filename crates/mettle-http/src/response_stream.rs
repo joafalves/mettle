@@ -182,18 +182,6 @@ impl DeferredField for Field {
                     .response
                     .context
                     .content_codec(self.response.span.source, media);
-                if let Some(custom) = custom.as_ref().filter(|codec| codec.incremental()) {
-                    super::incoming::validate_content_encoding(&self.response.headers, span)?;
-                    let source = self.response.chunks(&self.response.context);
-                    return custom
-                        .decode_source(
-                            source,
-                            self.response.max_capture,
-                            self.response.span,
-                            &self.response.context,
-                        )
-                        .await;
-                }
                 if media.essence == "text/event-stream" && custom.is_none() {
                     super::incoming::validate_content_encoding(&self.response.headers, span)?;
                     media.validate_encoding(span)?;

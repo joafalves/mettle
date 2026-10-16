@@ -89,7 +89,6 @@ impl Compiler<'_> {
                 media_types: media_sets[id].clone(),
                 encode_flow: codec.encode_flow,
                 decode_flow: codec.decode_flow,
-                incremental: codec.is_incremental(self.program),
             });
         }
         registrations
@@ -97,8 +96,13 @@ impl Compiler<'_> {
 
     pub(super) fn validate_codec_bodies(&mut self, flows: &[MettlePlan]) {
         for flow in flows {
-            if flow.kind == DeclarationKind::Codec {
-                inspect_statements(&flow.instructions, self.capabilities, &mut self.errors);
+            if matches!(flow.kind, DeclarationKind::Codec | DeclarationKind::Framing) {
+                inspect_statements(
+                    &flow.instructions,
+                    self.capabilities,
+                    &mut self.errors,
+                    flow.kind == DeclarationKind::Framing,
+                );
             }
         }
     }
@@ -146,7 +150,7 @@ fn validate_media(
 
 fn reject(errors: &mut Vec<CompileError>, span: mettle_syntax::Span) {
     errors.push(CompileError::new(
-        "codec conversion bodies must be pure: use values, loops, checks, and built-in json/text/bytes operations only",
+        "codec and framing bodies must be pure: use values, loops, checks, input.readUntil/readExactly, and built-in json/text/bytes operations only",
         span,
     ));
 }
@@ -155,6 +159,7 @@ fn inspect_statements(
     instructions: &[Instruction],
     capabilities: &[mettle_capability::CapabilityDescriptor],
     errors: &mut Vec<CompileError>,
+    framer: bool,
 ) {
     for instruction in instructions {
         match instruction {
@@ -162,28 +167,28 @@ fn inspect_statements(
             Instruction::Echo { value, .. } => {
                 reject(errors, value.span);
             }
-            Instruction::Yield(value) => inspect_expression(value, capabilities, errors),
+            Instruction::Yield(value) => inspect_expression(value, capabilities, errors, framer),
             Instruction::If {
                 branches,
                 else_body,
             } => {
                 for branch in branches {
-                    inspect_expression(&branch.condition, capabilities, errors);
-                    inspect_statements(&branch.instructions, capabilities, errors);
+                    inspect_expression(&branch.condition, capabilities, errors, framer);
+                    inspect_statements(&branch.instructions, capabilities, errors, framer);
                 }
                 if let Some(body) = else_body {
-                    inspect_statements(body, capabilities, errors);
+                    inspect_statements(body, capabilities, errors, framer);
                 }
             }
             Instruction::Bind { expression, .. }
             | Instruction::Evaluate(expression)
             | Instruction::Return(expression) => {
-                inspect_expression(expression, capabilities, errors);
+                inspect_expression(expression, capabilities, errors, framer);
             }
             Instruction::Assert { condition, message } => {
-                inspect_expression(condition, capabilities, errors);
+                inspect_expression(condition, capabilities, errors, framer);
                 if let Some(message) = message {
-                    inspect_expression(message, capabilities, errors);
+                    inspect_expression(message, capabilities, errors, framer);
                 }
             }
         }
@@ -194,49 +199,54 @@ fn inspect_expression(
     value: &PlanExpression,
     capabilities: &[mettle_capability::CapabilityDescriptor],
     errors: &mut Vec<CompileError>,
+    framer: bool,
 ) {
     match &value.kind {
         PlanExpressionKind::Constant(_) | PlanExpressionKind::Local(_) => {}
         PlanExpressionKind::Array(values) => {
             for value in values {
-                inspect_expression(value, capabilities, errors);
+                inspect_expression(value, capabilities, errors, framer);
             }
         }
         PlanExpressionKind::Object(fields) => {
             for field in fields {
-                inspect_expression(&field.expression, capabilities, errors);
+                inspect_expression(&field.expression, capabilities, errors, framer);
             }
         }
-        PlanExpressionKind::Block { instructions, .. }
-        | PlanExpressionKind::ValueStream { instructions, .. } => {
-            inspect_statements(instructions, capabilities, errors);
+        PlanExpressionKind::Block { instructions, .. } => {
+            inspect_statements(instructions, capabilities, errors, framer);
+        }
+        PlanExpressionKind::Source { instructions, .. } if framer => {
+            inspect_statements(instructions, capabilities, errors, framer);
         }
         PlanExpressionKind::For {
             iterable,
             instructions,
             ..
         } => {
-            inspect_expression(iterable, capabilities, errors);
-            inspect_statements(instructions, capabilities, errors);
+            inspect_expression(iterable, capabilities, errors, framer);
+            inspect_statements(instructions, capabilities, errors, framer);
         }
         PlanExpressionKind::Member { value, .. }
         | PlanExpressionKind::Not(value)
         | PlanExpressionKind::Negate(value)
         | PlanExpressionKind::Sensitive(value)
         | PlanExpressionKind::TypeOperation { value, .. }
-        | PlanExpressionKind::Fail(value) => inspect_expression(value, capabilities, errors),
+        | PlanExpressionKind::Fail(value) => {
+            inspect_expression(value, capabilities, errors, framer);
+        }
         PlanExpressionKind::Index { value, index } => {
-            inspect_expression(value, capabilities, errors);
-            inspect_expression(index, capabilities, errors);
+            inspect_expression(value, capabilities, errors, framer);
+            inspect_expression(index, capabilities, errors, framer);
         }
         PlanExpressionKind::Binary { left, right, .. } => {
-            inspect_expression(left, capabilities, errors);
-            inspect_expression(right, capabilities, errors);
+            inspect_expression(left, capabilities, errors, framer);
+            inspect_expression(right, capabilities, errors, framer);
         }
         PlanExpressionKind::InterpolatedString(parts) => {
             for part in parts {
                 if let StringPart::Value(value) = part {
-                    inspect_expression(value, capabilities, errors);
+                    inspect_expression(value, capabilities, errors, framer);
                 }
             }
         }
@@ -251,14 +261,32 @@ fn inspect_expression(
                 reject(errors, value.span);
             }
             for argument in arguments {
-                inspect_expression(argument, capabilities, errors);
+                inspect_expression(argument, capabilities, errors, framer);
             }
             for option in options {
-                inspect_expression(&option.expression, capabilities, errors);
+                inspect_expression(&option.expression, capabilities, errors, framer);
+            }
+        }
+        PlanExpressionKind::ResourceCall {
+            receiver,
+            method,
+            arguments,
+            named_arguments,
+        } if framer => {
+            if !crate::documentation::is_frame_reader_method(method) {
+                reject(errors, value.span);
+            }
+            inspect_expression(receiver, capabilities, errors, framer);
+            for argument in arguments {
+                inspect_expression(argument, capabilities, errors, framer);
+            }
+            for field in named_arguments {
+                inspect_expression(&field.expression, capabilities, errors, framer);
             }
         }
         PlanExpressionKind::Context(_)
         | PlanExpressionKind::CodecCall { .. }
+        | PlanExpressionKind::FramingCall { .. }
         | PlanExpressionKind::Environment(_)
         | PlanExpressionKind::Source { .. }
         | PlanExpressionKind::ResourceCall { .. }

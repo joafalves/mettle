@@ -13,13 +13,13 @@
 (null) @constant.builtin
 
 ["flow" "context" "codec" "namespace" "defaults" "test"] @keyword
+(framing_declaration "framing" @keyword)
 "use" @keyword.import
 "return" @keyword.return
 ["if" "else"] @keyword.conditional
 ["for" "in"] @keyword.repeat
 ["break" "yield"] @keyword.return
 (source_expression "source" @keyword)
-(stream_expression "stream" @keyword)
 ["within" "retry" "parallel" "rate" "concurrency"] @keyword
 ["assert" "fail"] @function.builtin
 ["and" "or" "not" "is" "as"] @keyword.operator
@@ -43,6 +43,11 @@
 (namespace_use name: (identifier) @module)
 (context_declaration name: (identifier) @type)
 (codec_declaration name: (identifier) @type)
+(framing_declaration name: (identifier) @type)
+(framing_declaration value: (call_expression function: (identifier) @function.builtin))
+(framing_method name: _ @function)
+(framing_method parameter: (identifier) @variable.parameter)
+(framing_max_frame_bytes name: (identifier) @property)
 (codec_use name: (identifier) @type)
 (codec_method name: _ @function)
 (codec_method parameter: (identifier) @variable.parameter)

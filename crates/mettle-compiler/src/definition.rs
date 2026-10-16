@@ -59,6 +59,26 @@ pub fn resolve_documentation_codec(
     }
 }
 
+/// Resolve a named framing with the same namespace rules as execution.
+#[must_use]
+pub fn resolve_documentation_framing(
+    program: &Program,
+    name: &str,
+    namespace: &str,
+    uses: &[mettle_syntax::Spanned<String>],
+) -> Option<usize> {
+    let ids = program
+        .framers
+        .iter()
+        .enumerate()
+        .map(|(id, framer)| (qualified_name(&framer.namespace, &framer.name.value), id))
+        .collect();
+    match resolve_visible_name(&ids, name, namespace, uses) {
+        NameResolution::Found(id) => Some(id),
+        _ => None,
+    }
+}
+
 /// Find the declaration behind a flow call or local binding reference.
 #[must_use]
 pub fn find_implementation(program: &Program, source: usize, byte: usize) -> Option<Span> {
@@ -84,6 +104,7 @@ struct DefinitionFinder<'a> {
     context_ids: HashMap<String, usize>,
     flow_ids: HashMap<String, usize>,
     codec_ids: HashMap<String, usize>,
+    framing_ids: HashMap<String, usize>,
 }
 
 impl<'a> DefinitionFinder<'a> {
@@ -116,6 +137,12 @@ impl<'a> DefinitionFinder<'a> {
             .enumerate()
             .map(|(id, codec)| (qualified_name(&codec.namespace, &codec.name.value), id))
             .collect();
+        let framing_ids = program
+            .framers
+            .iter()
+            .enumerate()
+            .map(|(id, framer)| (qualified_name(&framer.namespace, &framer.name.value), id))
+            .collect();
         Self {
             program,
             source,
@@ -123,10 +150,43 @@ impl<'a> DefinitionFinder<'a> {
             context_ids,
             flow_ids,
             codec_ids,
+            framing_ids,
         }
     }
 
+    /// A built-in framing's `mediaType: codec.mediaType` names a codec.
+    fn framing_media_type(&self, framer: &mettle_syntax::FramerDecl) -> Option<Span> {
+        let ExpressionKind::Call {
+            named_arguments, ..
+        } = &framer.builtin.as_ref()?.kind
+        else {
+            return None;
+        };
+        let field = named_arguments
+            .iter()
+            .find(|field| field.name.value == "mediaType" && self.at(field.expression.span))?;
+        let ExpressionKind::Name(name) = &field.expression.kind else {
+            return None;
+        };
+        let codec = name.strip_suffix(".mediaType")?;
+        let id = resolve_documentation_codec(
+            self.program,
+            codec,
+            &framer.namespace,
+            &framer.namespace_uses,
+        )?;
+        Some(self.program.codecs[id].name.span)
+    }
+
     fn find(&self) -> Option<Span> {
+        for framer in &self.program.framers {
+            if self.at(framer.name.span) {
+                return Some(framer.name.span);
+            }
+            if let Some(target) = self.framing_media_type(framer) {
+                return Some(target);
+            }
+        }
         for codec in &self.program.codecs {
             if self.at(codec.name.span) || self.at(codec.media_type.span) {
                 return Some(codec.name.span);
@@ -342,9 +402,7 @@ impl<'a> DefinitionFinder<'a> {
                     }
                 }
             }
-            ExpressionKind::Block(statements)
-            | ExpressionKind::Source(statements)
-            | ExpressionKind::ValueStream(statements) => {
+            ExpressionKind::Block(statements) | ExpressionKind::Source(statements) => {
                 if let Some(flow) = flow {
                     return self.find_in_statements(statements, &mut locals.clone(), flow);
                 }
@@ -374,8 +432,23 @@ impl<'a> DefinitionFinder<'a> {
                 options,
             } => {
                 if self.at(callee.span)
+                    && let Some((framing_name, method)) = callee.value.rsplit_once('.')
+                    && matches!(method, "frames" | "encode")
+                    && !locals.contains_key(framing_name.split('.').next().unwrap_or_default())
+                    && let Some(flow) = flow
+                    && let NameResolution::Found(id) = resolve_visible_name(
+                        &self.framing_ids,
+                        framing_name,
+                        &flow.namespace,
+                        &flow.namespace_uses,
+                    )
+                {
+                    return Some(self.program.framers[id].name.span);
+                }
+                if self.at(callee.span)
                     && let Some((codec_name, method)) = callee.value.rsplit_once('.')
                     && matches!(method, "encode" | "decode")
+                    && !locals.contains_key(codec_name.split('.').next().unwrap_or_default())
                     && let Some(flow) = flow
                     && let Some(id) = resolve_documentation_codec(
                         self.program,

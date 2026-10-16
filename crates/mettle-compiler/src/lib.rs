@@ -21,6 +21,7 @@ pub struct ExecutionPlan {
     pub capability_names: Vec<String>,
     pub contexts: Vec<ContextPlan>,
     pub codecs: Vec<CodecPlan>,
+    pub framers: Vec<FramerPlan>,
     pub flows: Vec<MettlePlan>,
     pub default_flow: Option<usize>,
 }
@@ -32,7 +33,21 @@ pub struct CodecPlan {
     pub media_types: Vec<String>,
     pub encode_flow: usize,
     pub decode_flow: usize,
-    pub incremental: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FramerPlan {
+    pub name: String,
+    pub framing: FramingKind,
+    /// Normalized media type assigned to every frame by a built-in framing.
+    pub media_type: Option<String>,
+    pub max_frame_bytes: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FramingKind {
+    Builtin(mettle_capability::framing::BuiltinFraming),
+    Custom { read_flow: usize, write_flow: usize },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -127,13 +142,17 @@ pub enum PlanExpressionKind {
         instructions: Vec<Instruction>,
         local_count: usize,
     },
-    ValueStream {
-        instructions: Vec<Instruction>,
-        local_count: usize,
+    /// `name.frames(input)` or `name.encode(frame)` on a declared framing.
+    FramingCall {
+        framer: usize,
+        encode: bool,
+        argument: Box<PlanExpression>,
     },
     ResourceCall {
         receiver: Box<PlanExpression>,
         method: String,
+        arguments: Vec<PlanExpression>,
+        named_arguments: Vec<PlanField>,
     },
     Constant(Constant),
     Local(usize),
@@ -316,6 +335,7 @@ pub use lowering::{compile, compile_with_capabilities};
 mod definition;
 pub use definition::{
     find_definition, find_implementation, resolve_documentation_codec, resolve_documentation_flow,
+    resolve_documentation_framing,
 };
 
 fn flow_display_name(flow: &MettleDecl, flow_id: usize) -> String {
@@ -1068,6 +1088,169 @@ mod tests {
                 .iter()
                 .any(|error| error.message.contains("use codec"))
         );
+    }
+
+    #[test]
+    fn inline_codec_declaration_registers_only_in_its_file() {
+        let source = r#"use codec temperature {
+            mediaType: "application/vnd.example.temperature"
+            encode(value) { value as bytes }
+            decode(bytes) { bytes }
+        }
+        flow main = temperature.decode(temperature.encode("23"))"#;
+        let program = parse(source).unwrap();
+        assert_eq!(program.codecs.len(), 1);
+        assert_eq!(program.codec_uses.len(), 1);
+        assert_eq!(program.codecs[0].name.span, program.codec_uses[0].name.span);
+        let plan = compile(&program).unwrap();
+        assert_eq!(plan.codecs.len(), 1);
+        assert_eq!(plan.codecs[0].source, 0);
+        assert!(plan.flows[plan.codecs[0].encode_flow].name.is_none());
+
+        let duplicate = parse(&format!("{source}\nuse codec temperature")).unwrap();
+        assert!(
+            compile(&duplicate)
+                .unwrap_err()
+                .iter()
+                .any(|error| { error.message.contains("registered more than once") })
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn framings_resolve_shared_constants_and_reject_invalid_declarations() {
+        use crate::{FramingKind, PlanExpression};
+        use mettle_capability::codecs::{BYTES_DESCRIPTOR, JSON_DESCRIPTOR, TEXT_DESCRIPTOR};
+        use mettle_capability::framing::{BuiltinFraming, DEFAULT_MAX_FRAME_BYTES, LengthPrefix};
+        let capabilities = [JSON_DESCRIPTOR, TEXT_DESCRIPTOR, BYTES_DESCRIPTOR];
+        let compile =
+            |source: &str| compile_with_capabilities(&parse(source).unwrap(), &capabilities);
+        let plan = compile(
+            r#"codec note {
+                mediaType: "Application/X-Note"
+                encode(value) { text.encode(value) }
+                decode(bytes) { text.decode(bytes) }
+            }
+            framing lines = delimited("\r\n", mediaType: json.mediaType, requireFinalDelimiter: false)
+            framing packets = lengthPrefixed(u16le, mediaType: note.mediaType, maxFrameBytes: 64)
+            framing cells = fixed(4)
+            framing custom {
+                read(input) { return { bodyBytes: input.readExactly(1) } }
+                write(frame) { frame.bodyBytes }
+            }
+            flow main(input) {
+                lines = { frames: "a local shadows the framing" }
+                lines.frames
+            }
+            flow encoded = packets.encode({ body: "x" })"#,
+        )
+        .unwrap();
+        let lines = &plan.framers[0];
+        assert_eq!(
+            lines.framing,
+            FramingKind::Builtin(BuiltinFraming::Delimited {
+                delimiter: "\r\n".into(),
+                require_final_delimiter: false,
+            })
+        );
+        assert_eq!(lines.media_type.as_deref(), Some("application/json"));
+        assert_eq!(lines.max_frame_bytes, DEFAULT_MAX_FRAME_BYTES);
+        let packets = &plan.framers[1];
+        assert_eq!(
+            packets.framing,
+            FramingKind::Builtin(BuiltinFraming::LengthPrefixed(LengthPrefix::U16Le))
+        );
+        assert_eq!(packets.media_type.as_deref(), Some("application/x-note"));
+        assert_eq!(packets.max_frame_bytes, 64);
+        assert_eq!(plan.framers[2].max_frame_bytes, 4);
+        assert!(matches!(
+            plan.framers[3].framing,
+            FramingKind::Custom { .. }
+        ));
+        let encoded = plan
+            .flows
+            .iter()
+            .find(|flow| flow.name.as_deref() == Some("encoded"))
+            .unwrap();
+        assert!(matches!(
+            &encoded.instructions[0],
+            Instruction::Return(PlanExpression {
+                kind: PlanExpressionKind::FramingCall {
+                    framer: 1,
+                    encode: true,
+                    ..
+                },
+                ..
+            })
+        ));
+
+        // A built-in framing takes named arguments, never a trailing option block.
+        assert!(parse("framing a = delimited(\"\\n\") { mediaType: \"x\" }").is_err());
+        for (source, message) in [
+            (
+                "framing a = lengthPrefixed(u24)",
+                "length prefix must be one of",
+            ),
+            (
+                "framing a = lengthPrefixed(\"u32be\")",
+                "length prefix must be one of",
+            ),
+            ("framing a = fixed(0)", "positive integer literal"),
+            (
+                "framing a = fixed(4, maxFrameBytes: 8)",
+                "does not accept `maxFrameBytes`",
+            ),
+            (
+                "framing a = delimited(\"\")",
+                "nonempty string literal delimiter",
+            ),
+            (
+                "framing a = delimited(\"ab\", maxFrameBytes: 2)",
+                "leaves no room for a body",
+            ),
+            (
+                "framing a = delimited(\"\\n\", requireFinalDelimiter: 1)",
+                "true or false",
+            ),
+            (
+                "framing a = delimited(\"\\n\", mediaType: nothing.mediaType)",
+                "neither a codec",
+            ),
+            (
+                "framing a = delimited(\"\\n\", mediaType: \"not a type\")",
+                "media type",
+            ),
+            (
+                "framing json = fixed(2)",
+                "conflicts with a built-in capability",
+            ),
+            (
+                "framing a = fixed(2)\nframing a = fixed(3)",
+                "declared more than once",
+            ),
+            (
+                "framing a = fixed(2)\nflow main = a.frames(1, 2)",
+                "exactly one positional argument",
+            ),
+            (
+                "framing a { maxFrameBytes: 0\n read(input) { null }\n write(frame) { frame } }",
+                "positive integer literal",
+            ),
+            (
+                "framing a { read(input) { echo(\"x\")\n null }\n write(frame) { frame } }",
+                "must be pure",
+            ),
+            (
+                "flow main(input) = input.readUntil(\"\\n\", maxBytes: 1) { x: 1 }",
+                "do not take option blocks",
+            ),
+        ] {
+            let errors = compile(source).expect_err(source);
+            assert!(
+                errors.iter().any(|error| error.message.contains(message)),
+                "{source}: {errors:?}"
+            );
+        }
     }
 
     #[test]

@@ -45,6 +45,13 @@ def main() -> None:
             assert json.loads(call("run", str(program), "streaming", "--raw").stdout) == {
                 "celsius": 23}
 
+            inline = folder / "inline-codec.mettle"
+            inline.write_text(source.replace("codec temperature {", "use codec temperature {", 1)
+                              .replace("\nuse codec temperature\n", "\n", 1))
+            assert json.loads(call("run", str(inline), "--raw").stdout) == {
+                "local": {"celsius": 22}, "received": {"celsius": 23}, "sent": "24"
+            }
+
             # A sibling project file sees the declaration but not its registration.
             project = folder / "project"
             project.mkdir()

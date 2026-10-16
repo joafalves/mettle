@@ -56,3 +56,155 @@ flow main = temperature.mediaType
     (member_expression
       (identifier)
       (identifier))))
+
+================================================================================
+Inline codec declaration and file registration
+================================================================================
+
+use codec note {
+    mediaType: "application/x-note"
+    encode(value) { text.encode(value as string) }
+    decode(bytes) { text.decode(bytes) }
+}
+
+---
+
+(source_file
+  (codec_use
+    (identifier)
+    (codec_body
+      (codec_media_type
+        (identifier)
+        (string
+          (string_content)))
+      (codec_method
+        (identifier)
+        (block
+          (expression_statement
+            (call_expression
+              (member_expression
+                (identifier)
+                (identifier))
+              (argument_list
+                (type_operation
+                  (identifier)
+                  (value_kind)))))))
+      (codec_method
+        (identifier)
+        (block
+          (expression_statement
+            (call_expression
+              (member_expression
+                (identifier)
+                (identifier))
+              (argument_list
+                (identifier)))))))))
+
+================================================================================
+Built-in framings and frame methods
+================================================================================
+
+framing lines = delimited("\n", mediaType: json.mediaType, maxFrameBytes: 8192)
+framing packets = lengthPrefixed(u32be)
+flow main = lines.frames(source { yield "a\n" })
+
+---
+
+(source_file
+  (framing_declaration
+    (identifier)
+    (call_expression
+      (identifier)
+      (argument_list
+        (string
+          (escape_sequence))
+        (named_argument
+          (identifier)
+          (member_expression
+            (identifier)
+            (identifier)))
+        (named_argument
+          (identifier)
+          (integer)))))
+  (framing_declaration
+    (identifier)
+    (call_expression
+      (identifier)
+      (argument_list
+        (identifier))))
+  (flow_declaration
+    (identifier)
+    (call_expression
+      (member_expression
+        (identifier)
+        (identifier))
+      (argument_list
+        (source_expression
+          (block
+            (yield_statement
+              (string
+                (string_content)
+                (escape_sequence)))))))))
+
+================================================================================
+Custom framing methods
+================================================================================
+
+framing records {
+    maxFrameBytes: 4096
+    read(input) { input.readExactly(2) }
+    write(frame) { frame.bodyBytes }
+}
+
+---
+
+(source_file
+  (framing_declaration
+    (identifier)
+    (framing_body
+      (framing_max_frame_bytes
+        (identifier)
+        (integer))
+      (framing_method
+        (identifier)
+        (block
+          (expression_statement
+            (call_expression
+              (member_expression
+                (identifier)
+                (identifier))
+              (argument_list
+                (integer))))))
+      (framing_method
+        (identifier)
+        (block
+          (expression_statement
+            (member_expression
+              (identifier)
+              (identifier))))))))
+
+================================================================================
+Framing stays a contextual name
+================================================================================
+
+flow main {
+    framing = { layout: 1 }
+    framing.layout
+}
+
+---
+
+(source_file
+  (flow_declaration
+    (identifier)
+    (block
+      (binding
+        (identifier)
+        (object
+          (object_field
+            (identifier)
+            (integer))))
+      (expression_statement
+        (member_expression
+          (identifier)
+          (identifier))))))

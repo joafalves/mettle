@@ -1,0 +1,21 @@
+// From the repository root: mettle run examples/language/framing.mettle
+// A framing also works on a file byte source. The file is read incrementally.
+
+framing jsonLines = delimited("\n", mediaType: json.mediaType, maxFrameBytes: 8192)
+
+// Length-prefixed frames carry their size, so bodies may contain any byte.
+framing packets = lengthPrefixed(u16be, mediaType: text.mediaType, maxFrameBytes: 1024)
+
+flow main {
+    for frame in jsonLines.frames(fs.stream("./examples/language/records.jsonl")) {
+        echo(frame.body.name)
+    }
+    encoded = bytes.concat([
+        packets.encode({ body: "multi\nline" }),
+        packets.encode({ body: "second" })
+    ])
+    for frame in packets.frames(encoded) {
+        echo(frame.body)
+    }
+    "Finished reading frames"
+}

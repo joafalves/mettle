@@ -288,6 +288,35 @@ fn language_docs_cover_keywords_helpers_and_primitive_kinds_offline() {
 }
 
 #[test]
+fn framing_docs_render_offline_and_http_points_to_declared_framings() {
+    let docs = |name: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_mettle"))
+            .args(["docs", name])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{name}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    for name in [
+        "framing.delimited",
+        "framing.lengthPrefixed",
+        "framing.fixed",
+        "framing.frames",
+        "framing.encode",
+        "framing.readUntil",
+        "framing.readExactly",
+    ] {
+        let reference = docs(name);
+        assert!(reference.contains("## Bounds"), "{name}");
+    }
+    assert!(docs("framing").contains("## Built-in framings"));
+    // HTTP references must describe a call the compiler accepts.
+    let http = docs("http.get");
+    assert!(http.contains("name.frames(response.chunks)"), "{http}");
+    assert!(!http.contains("framing.frames("), "{http}");
+}
+
+#[test]
 fn check_validates_a_source_file() {
     let path = source_file("flow main() { return \"valid\" }");
     let output = Command::new(env!("CARGO_BIN_EXE_mettle"))

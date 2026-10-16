@@ -1,5 +1,18 @@
 # Change Log
 
+## Unreleased
+
+- Offer an inline `use codec name { ... }` snippet that declares and registers
+  a codec in one step, with matching hover, navigation, and highlighting.
+- Highlight `framing` declarations, built-in `delimited`, `lengthPrefixed`, and
+  `fixed` framings, and custom read/write methods; `framing` stays an ordinary
+  name elsewhere. Replace the incremental codec snippet with delimited,
+  length-prefixed, custom-framing, and frame-loop snippets.
+- Navigate to declared framings and to codecs named by a framing `mediaType`;
+  show hover and signature help for `name.frames(source)`, `name.encode(frame)`,
+  built-in framing arguments and length prefixes, and `input.readUntil` /
+  `input.readExactly` in custom read methods.
+
 ## 1.0.0-alpha.1
 
 - Add `codec`/`use codec` highlighting and a declaration snippet; the language

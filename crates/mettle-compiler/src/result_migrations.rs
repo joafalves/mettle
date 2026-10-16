@@ -175,6 +175,7 @@ fn instructions(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn expression(
     value: &PlanExpression,
     locals: &Locals,
@@ -185,8 +186,18 @@ fn expression(
     let mut visit =
         |value: &PlanExpression| expression(value, locals, origins, capabilities, errors);
     match &value.kind {
-        PlanExpressionKind::ResourceCall { receiver, .. } => visit(receiver),
-        PlanExpressionKind::CodecCall { argument, .. } => visit(argument),
+        PlanExpressionKind::ResourceCall {
+            receiver,
+            arguments,
+            named_arguments,
+            ..
+        } => {
+            visit(receiver);
+            let named = named_arguments.iter().map(|field| &field.expression);
+            arguments.iter().chain(named).for_each(visit);
+        }
+        PlanExpressionKind::CodecCall { argument, .. }
+        | PlanExpressionKind::FramingCall { argument, .. } => visit(argument),
         PlanExpressionKind::Member {
             value: object,
             member,
@@ -253,9 +264,6 @@ fn expression(
             }
         }
         PlanExpressionKind::Source {
-            instructions: body, ..
-        }
-        | PlanExpressionKind::ValueStream {
             instructions: body, ..
         }
         | PlanExpressionKind::Block {

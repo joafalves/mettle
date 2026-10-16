@@ -1,49 +1,126 @@
 // Run with the local fixture: python3 util/test-server/http_fixture.py --port 8080
 // mettle test examples/http/incremental.mettle
-// A streamed .body is decoded by its response media type; .chunks remains raw.
+// A framing locates each complete frame; a codec interprets its body.
 
-codec records {
+use codec records {
     mediaType: "application/x-mettle-incremental"
 
-    encode(value) { text.encode(value as string) }
-    // A single decoder accepts a byte source and yields complete native records.
-    decode(input) {
-        stream {
-            for line in text.lines(input) {
-                yield { text: line }
-            }
+    encode(value) { text.encode(value.text) }
+    decode(bytes) { { text: text.decode(bytes) } }
+}
+
+framing recordLines = delimited("\n", mediaType: records.mediaType, maxFrameBytes: 8192)
+
+use codec note {
+    mediaType: "application/x-mettle-note"
+    encode(value) { text.encode(value.message) }
+    decode(bytes) { { message: text.decode(bytes) } }
+}
+
+// The header defines each record's representation; the codec decodes only
+// after readExactly has assembled the complete payload.
+framing mixedEvents {
+    maxFrameBytes: 8192
+    read(input) {
+        headerBytes = input.readUntil("\n", maxBytes: 4096)
+        if (headerBytes is null) { return null }
+        header = json.decode(headerBytes)
+        return {
+            mediaType: header.mediaType,
+            bodyBytes: input.readExactly(header.length)
+        }
+    }
+    write(frame) {
+        header = json.encode({
+            mediaType: frame.mediaType,
+            length: bytes.length(frame.bodyBytes)
+        })
+        source {
+            yield header
+            yield "\n"
+            yield frame.bodyBytes
         }
     }
 }
 
-use codec records
 use context {
     defaults http {
         headers: { Authorization: "Bearer local-test-token" }
     }
 }
 
-test "consume a registered incremental codec" {
+test "frame a streamed response and decode each record" {
     response = http.get("http://127.0.0.1:8080/content/incremental", stream: true)
     assert(response.status == 200)
-    for index, record in response.body {
-        if (index == 0) { assert(record.text == "one") }
-        if (index == 1) { assert(record.text == "two") }
-        if (index == 2) { assert(record.text == "three") }
+    for index, frame in recordLines.frames(response.chunks) {
+        if (index == 0) { assert(frame.body.text == "one") }
+        if (index == 1) { assert(frame.body.text == "two") }
+        if (index == 2) { assert(frame.body.text == "three") }
     }
 }
 
-test "ordinary calls still use complete-value decoding" {
-    response = http.get("http://127.0.0.1:8080/content/incremental")
-    assert(response.body[0].text == "one")
-    assert(response.body[1].text == "two")
-    assert(response.body[2].text == "three")
+flow checkFeed(name) {
+    response = http.get("http://127.0.0.1:8080/content/incremental", stream: true)
+    assert(response.status == 200)
+    for index, frame in recordLines.frames(response.chunks) {
+        echo({ feed: name, value: frame.body.text })
+        if (index == 2) { assert(frame.body.text == "three") }
+    }
+    name
 }
 
-test "direct incremental decode collects complete records" {
-    records = records.decode(text.encode("alpha\nbeta\n"))
-    assert(records[0].text == "alpha")
-    assert(records[1].text == "beta")
+test "consume independent HTTP streams in parallel" {
+    completed = parallel {
+        orders: checkFeed("orders")
+        payments: checkFeed("payments")
+        deliveries: checkFeed("deliveries")
+    }
+    assert(completed.orders == "orders")
+    assert(completed.payments == "payments")
+    assert(completed.deliveries == "deliveries")
+}
+
+test "ordinary calls still decode one complete value" {
+    response = http.get("http://127.0.0.1:8080/content/incremental")
+    assert(response.body.text == "one\ntwo\nthree\n")
+}
+
+test "direct codec decode handles exactly one complete value" {
+    record = records.decode(text.encode("alpha"))
+    assert(record.text == "alpha")
+    assert(content.decode(text.encode("beta"), mediaType: records.mediaType).text == "beta")
+}
+
+test "a delimited framing encodes one native body and decodes it again" {
+    encoded = recordLines.encode({ body: { text: "round trip" } })
+    for frame in recordLines.frames(encoded) {
+        assert(frame.body.text == "round trip")
+        assert(frame.mediaType == records.mediaType)
+    }
+}
+
+test "POST receives a framed mixed-media stream" {
+    response = http.post("http://127.0.0.1:8080/content/mixed-events",
+        mediaType: "application/x-mettle-framed",
+        body: source {
+            yield mixedEvents.encode({ mediaType: json.mediaType,
+                body: { subscribe: true } })
+            yield mixedEvents.encode({ mediaType: note.mediaType,
+                body: { message: "client ready" } })
+        },
+        stream: true)
+    assert(response.status == 200)
+    for index, frame in mixedEvents.frames(response.chunks) {
+        if (index == 0) { assert(frame.body.kind == "ready") }
+        if (index == 1) { assert(frame.body.message == "complete") }
+    }
+}
+
+test "a custom writer packages one bounded record" {
+    record = mixedEvents.encode({ mediaType: note.mediaType, body: { message: "hello" } })
+    for frame in mixedEvents.frames(record) {
+        assert(frame.body.message == "hello")
+    }
 }
 
 test "SSE is a decoded value stream" {

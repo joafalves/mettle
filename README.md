@@ -717,11 +717,11 @@ body kinds, metadata, bodyless responses, and explicit raw-byte decoding.
 
 ### Custom content codecs
 
-Declare a representation processor once, then explicitly register it in each
-file whose I/O calls should use it:
+Declare and register a representation processor for the current file in one
+step:
 
 ```mettle
-codec temperature {
+use codec temperature {
     mediaType: "application/vnd.example.temperature"
     aliases: ["application/x-temperature"]
 
@@ -737,13 +737,14 @@ codec temperature {
     }
 }
 
-use codec temperature
 flow main = http.post("/temperature", body: { celsius: 23 }, mediaType: temperature.mediaType)
 ```
 
 `temperature.mediaType` is a string constant available from the declaration;
-it does not register the codec by itself. `use codec temperature` applies to calls
-written in that source file regardless of its position. A project file can use a
+it does not register the codec by itself. `use codec temperature { ... }` both
+declares and registers the codec for calls in that source file, regardless of
+its position. Plain `codec temperature { ... }` only declares a reusable codec;
+activate it with a separate `use codec temperature`. A project file can use a
 codec declared in another project file, following normal namespace visibility.
 Other files do not inherit the registration. HTTP selects an exact registered
 media type (including its declared parameters or alias) before generic `+json`
@@ -764,48 +765,105 @@ flow roundTripTemperature {
 }
 ```
 
-These direct calls also require `use codec temperature`; they do not perform
-filesystem access themselves. `encode` takes one positional native value,
-and a direct `decode` call takes one positional complete byte value. For an
-incremental decoder, the direct call returns a bounded array of decoded records.
+These direct calls also require codec registration, either in the declaration
+or through a separate `use codec temperature`; they do not perform
+filesystem access themselves. `encode` takes one native value and **must return
+bytes**. `decode(bytes)` takes complete bytes and returns exactly one native
+value. Neither method owns stream boundaries.
 
-An encoder takes one ordinary value and **must return bytes**. A decoder has
-one of two shapes. `decode(bytes)` returns one complete native value;
-`decode(input)` can instead return `stream { ... }`, lazily yielding complete
-native records from a byte source. The latter shape is selected when its final
-expression is a `stream` block—no extra chunk or EOF methods are declared:
+Declare a `framing` when one byte source contains multiple messages. A framing
+finds each complete frame; a codec interprets its body:
 
 ```mettle
 codec records {
     mediaType: "application/x-records"
-    encode(value) { text.encode(value as string) }
-    decode(input) {
-        stream {
-            for line in text.lines(input) {
-                yield { text: line }
-            }
-        }
-    }
+    encode(value) { text.encode(value.text) }
+    decode(bytes) { { text: text.decode(bytes) } }
 }
 use codec records
+
+framing recordLines = delimited("\n", mediaType: records.mediaType, maxFrameBytes: 8192)
+
+flow readRecords {
+    response = http.get("/records", stream: true)
+    for frame in recordLines.frames(response.chunks) {
+        echo(frame.body.text)
+    }
+}
 ```
 
-HTTP uses the encoder for an ordinary `body` with that media type and the
-decoder for response `.body`; `.bodyBytes` and `response.chunks` remain raw.
-With `stream: true`, an incremental decoder yields records under backpressure;
-ordinary buffered calls and direct `records.decode(bytes)` collect them into
-a bounded array. `text.lines` handles UTF-8 and line boundaries across byte
-chunks. A byte source remains single-consumer, and completion of the stream
-block is EOF. Bytes and byte sources supplied as request bodies are already
+`recordLines.frames(input)` accepts complete bytes or an owned byte source
+(HTTP `response.chunks`, `fs.stream`, or a `source` block). It lazily yields
+`{ bodyBytes, mediaType, body }` frames; `body` is decoded by media type with a
+codec registered in the calling file, and unknown or missing media types leave
+it as bytes. Sources are single-consumer, transport chunks never mark frame
+boundaries, and stopping a loop early releases the source. Waiting for bytes is
+bounded by the source itself, such as an HTTP request `timeout`, so a quiet
+long-lived stream is not an error. After an error, the stream ends.
+
+`recordLines.encode({ body: value })` encodes one value with the media-type
+codec, then adds the frame boundary. Supply `bodyBytes` instead for already
+encoded bytes, but not alongside `body`. A frame `mediaType` must match the
+framing's own `mediaType` when it declares one.
+`content.decode(bytes, mediaType: ...)` decodes a single complete payload
+without a framing.
+
+Built-in framings:
+
+| Framing | Frames | Encoding |
+| --- | --- | --- |
+| `delimited("\n")` | Bytes before each delimiter; the delimiter is consumed. | Appends the delimiter; rejects a body that contains it. |
+| `lengthPrefixed(u32be)` | An unsigned byte length, then that many body bytes. | Writes the prefix; rejects a body too long for it. |
+| `fixed(16)` | Exactly that many bytes each. | Rejects a body of any other length. |
+
+Each accepts an optional `mediaType:` (a string literal, a built-in constant such
+as `json.mediaType`, or a codec's `name.mediaType`). `delimited` and
+`lengthPrefixed` accept `maxFrameBytes:`, which bounds one complete frame
+including its delimiter or prefix (1 MiB by default, 10 MiB at most); `fixed`
+is bounded by its size. Length prefixes are `u8`, `u16be`, `u16le`, `u32be`,
+`u32le`, `u64be`, and `u64le`, where `be` is network byte order. A declared
+length is checked against `maxFrameBytes` before its body is read. Input that
+ends inside a frame is a truncation error; `delimited` also requires a final
+delimiter unless it has `requireFinalDelimiter: false`.
+
+For other formats, such as a header that names each frame's media type, write a
+custom framing:
+
+```mettle
+framing mixedEvents {
+    maxFrameBytes: 8192
+    read(input) {
+        headerBytes = input.readUntil("\n", maxBytes: 4096)
+        if (headerBytes is null) { return null }
+        header = json.decode(headerBytes)
+        return { mediaType: header.mediaType, bodyBytes: input.readExactly(header.length) }
+    }
+    write(frame) {
+        header = json.encode({ mediaType: frame.mediaType, length: bytes.length(frame.bodyBytes) })
+        bytes.concat([header, text.encode("\n"), frame.bodyBytes])
+    }
+}
+```
+
+`input.readUntil(delimiter, maxBytes: ...)` returns the bytes before a delimiter,
+or `null` at a clean end of input; `input.readExactly(length)` rejects a
+truncated payload. Both are bounded by the remaining `maxFrameBytes`. `read`
+returns `{ bodyBytes, mediaType }` or `null` only at the end of input, and must
+consume at least one byte per frame. `write` receives complete `bodyBytes` and
+`mediaType` and returns bounded bytes or a byte source; encoding a non-bytes
+`body` needs a `mediaType`. Framing method bodies are pure, like codec
+conversions. `framing` is a contextual keyword, so existing names such as a
+`framing` variable remain valid. `mettle docs framing` lists the built-in
+framings and operations. See the [HTTP framing example](examples/http/incremental.mettle)
+and [file framing example](examples/language/framing.mettle).
+
+HTTP still uses a complete codec for ordinary `.body` and keeps `.bodyBytes`
+and streamed `.chunks` raw. Built-in SSE remains a special streamed `.body`
+value stream. Bytes and byte sources supplied as request bodies are already
 encoded and are never encoded again.
 
-This first incremental path includes bounded UTF-8 line framing and built-in
-SSE. Arbitrary binary framing still needs a dedicated incremental adapter; a
-raw transport chunk must not be treated as one complete application record.
-
 Codec bodies can use value expressions, `if`, loops, assertions, `fail`,
-and built-in `json`/`text`/`bytes` operations. Incremental decoders can use
-`stream`, `yield`, and `text.lines`; each emitted value is bounded. They cannot perform HTTP/filesystem
+and built-in `json`/`text`/`bytes` operations. They cannot perform HTTP/filesystem
 I/O, call flows, read environment/context values, create byte sources, or start
 execution policies. A codec's `fail` is a conversion failure, not a terminal
 exit from the entry; an enclosing `retry` can repeat the whole request. Inputs

@@ -66,6 +66,19 @@ class FixtureHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         if not self._authorized():
             return
+        if self.path == "/content/length-prefixed":
+            # u16be length-prefixed frames, written in pieces that split a
+            # prefix and a body; one body contains the newline byte.
+            frames = [b'{"id":1}', b"multi\nline", b""]
+            body = b"".join(len(frame).to_bytes(2, "big") + frame for frame in frames)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-mettle-length-prefixed")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            for start, end in ((0, 1), (1, 5), (5, 11), (11, len(body))):
+                self.wfile.write(body[start:end])
+                self.wfile.flush()
+            return
         if self.path.startswith("/content/"):
             self._content_response(self.path.removeprefix("/content/"))
             return
@@ -141,6 +154,47 @@ class FixtureHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         if not self._authorized():
+            return
+        if self.path == "/content/mixed-events":
+            incoming = self._read_body()
+            received = []
+            try:
+                while incoming:
+                    header_end = incoming.index(b"\n")
+                    header = json.loads(incoming[:header_end])
+                    length = header["length"]
+                    if not isinstance(length, int) or length < 0 or length > 8192:
+                        raise ValueError("invalid frame length")
+                    payload = incoming[header_end + 1:header_end + 1 + length]
+                    if len(payload) != length:
+                        raise ValueError("truncated frame")
+                    received.append((header["mediaType"], payload))
+                    incoming = incoming[header_end + 1 + length:]
+                if (
+                    len(received) != 2
+                    or received[0][0] != "application/json"
+                    or json.loads(received[0][1]) != {"subscribe": True}
+                    or received[1] != ("application/x-mettle-note", b"client ready")
+                ):
+                    raise ValueError("unexpected records")
+            except (ValueError, KeyError, TypeError):
+                self._json(400, {"error": "invalid framed request"})
+                return
+            records = [
+                ("application/json", b'{"kind":"ready","count":2}'),
+                ("application/x-mettle-note", b"complete"),
+            ]
+            body = b"".join(
+                json.dumps({"mediaType": media, "length": len(payload)}, separators=(",", ":")).encode() + b"\n" + payload
+                for media, payload in records
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-mettle-framed")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body[:7])
+            self.wfile.flush()
+            self.wfile.write(body[7:])
             return
         if self.path == "/reject-upload":
             self.close_connection = True

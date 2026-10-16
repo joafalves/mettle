@@ -13,7 +13,7 @@ Basic language support for `.mettle` source files.
   reusable and anonymous file contexts, `senv()`, `echo()`, conditionals, assertion messages, loops, named parallel branches, structured and load execution
   policies, and HTTP requests using named `body`;
 - snippets for complete filesystem reads, incremental copies, streamed HTTP downloads/uploads, and lazy `source`/`yield` producers;
-- `codec`/`use codec` snippets for complete and incremental decoders, with highlighting for `stream` value producers and conversion methods;
+- `use codec name { ... }` snippets for declaration and file-level registration, plus bounded `framing` snippets (delimited, length-prefixed, custom) and a frame loop;
 - highlighting and compiler-backed references for `source`, `yield`, and loop `break`;
 - highlighting for built-in `is`/`as` kind operations and snippets for codecs/media types;
 - compiler-backed **Run Flow** CodeLens actions above every named and anonymous flow;
@@ -68,12 +68,19 @@ filesystem and codec descriptions explain buffering, consumption, and decoding r
 selector and bound descriptions. Match fields come from the same Rust record that
 constructs runtime results. HTTP `stream`/`maxCaptureBytes` and streamed response
 `chunks`/`close` are documented in the registered schema, not in editor-only data.
-Declared codecs have Go to Definition from `use codec name` and
+Declared codecs have Go to Definition from `use codec name` (including the
+combined `use codec name { ... }` declaration) and
 `name.mediaType`, plus a hover showing the canonical media type, aliases, and
 file-level activation rule. Codec method bodies still use ordinary native-value
 hovers. Registered codecs can also be called directly as `name.encode(value)`
 and `name.decode(bytes)` for complete values; no separate editor codec registry
 is maintained.
+Declared framings have Go to Definition, hover, and parameter hints for
+`name.frames(bytesOrSource)` and `name.encode(frame)`. Hovers on built-in
+framings, their arguments and length prefixes, and on `input.readUntil` /
+`input.readExactly` in a custom `read` method come from the same reference as
+`mettle docs framing`. The keyword, declaration name, and built-in framings are
+highlighted by the packaged TextMate grammar.
 
 HTTP response references describe decoded native `.body` values and normalized
 `.mediaType`; `.bodyBytes` retains the representation bytes. The old response
@@ -203,6 +210,9 @@ code --install-extension dist/mettle-language-1.0.0-alpha.1.vsix --force
 Alternatively, open the Extensions view, choose **Install from VSIX…**, and select the package from `dist/`.
 
 Open any `.mettle` file after installation. VS Code should show `Mettle` as the language mode in the status bar. Reload the editor window if an already-open file does not update immediately.
+When changing the grammar in this repository, package and reinstall the VSIX
+before reloading the window. Reloading alone still uses the previously installed
+grammar, even when the source file in this checkout has changed.
 
 ## Development
 

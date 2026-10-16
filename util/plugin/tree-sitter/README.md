@@ -9,9 +9,12 @@ optional declaration parentheses, trailing commas in arrays/calls/policy options
 signed and base-prefixed numbers, exponents, and fractional durations, plus lazy
 `source { ... }` producers, `yield` statements, and loop `break`. `source` remains
 usable as a variable, parameter, or field name outside a producer expression.
-It also parses `codec` declarations with media-type aliases, `encode`/`decode`
-methods, `stream { ... yield ... }` value producers for incremental decoders,
-and explicit file-level `use codec` registration.
+It also parses complete-value `codec` declarations with media-type aliases and
+`encode`/`decode` methods, separate `framing` declarations (built-in calls such
+as `delimited("\n")` or custom `read`/`write` methods) for bounded frame
+boundaries, with `framing` kept usable as an ordinary name, and explicit
+file-level `use codec` registration, including inline `use codec name { ... }`
+declarations.
 Built-in `is`/`as` kind operations have matching Rust precedence, including
 continuations across comments/newlines and use inside loop iterables.
 The compiler remains responsible for name resolution, valid call targets,

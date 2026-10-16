@@ -14,6 +14,8 @@ use mettle_capability::{ByteReader, CapabilityError, ValueReader};
 use std::sync::atomic::{AtomicU64, Ordering};
 #[path = "codec.rs"]
 mod codec;
+#[path = "framing.rs"]
+mod framing;
 #[path = "producer.rs"]
 mod producer;
 
@@ -134,15 +136,24 @@ impl Runtime {
             )
         });
         let _guard = ExecutionIoGuard(io.clone());
-        codec::install(self, plan, &io).map_err(|error| RuntimeError {
-            message: error.message,
-            span: error.span,
-            flow_stack: Vec::new(),
-            scope_path: Vec::new().into_boxed_slice(),
-            assertions: Vec::new(),
-            assertion_only: false,
-            terminal: false,
-        })?;
+        if !plan.codecs.is_empty() || !plan.framers.is_empty() {
+            // Handlers share one plan copy and must not retain the entry
+            // context: IoContext owns their registry.
+            let mut engine = self.clone();
+            engine.io = None;
+            let shared = Arc::new(plan.clone());
+            codec::install(&engine, &shared, &io)
+                .and_then(|()| framing::install(&engine, &shared, &io))
+                .map_err(|error| RuntimeError {
+                    message: error.message,
+                    span: error.span,
+                    flow_stack: Vec::new(),
+                    scope_path: Vec::new().into_boxed_slice(),
+                    assertions: Vec::new(),
+                    assertion_only: false,
+                    terminal: false,
+                })?;
+        }
         let mut result = Executor {
             runtime: self,
             producer: None,
@@ -695,28 +706,73 @@ impl Executor<'_> {
                     self.next_scope_id.clone(),
                     expression.span,
                 )),
-                PlanExpressionKind::ValueStream {
-                    instructions,
-                    local_count,
-                } => Ok(producer::create_values(
-                    self.runtime.clone(),
-                    self.plan.clone(),
-                    instructions.clone(),
-                    *local_count,
-                    locals.to_vec(),
-                    context.clone(),
-                    self.io,
-                    self.flow_stack.clone(),
-                    self.scope_path.clone(),
-                    self.secrets.clone(),
-                    self.inside_workload,
-                    self.workload_id,
-                    self.next_scope_id.clone(),
-                    expression.span,
-                )),
-                PlanExpressionKind::ResourceCall { receiver, method } => {
+                PlanExpressionKind::FramingCall {
+                    framer,
+                    encode,
+                    argument,
+                } => {
+                    let input = self.evaluate(argument, locals, context).await?;
+                    let name = &self.plan.framers[*framer].name;
+                    let installed = self.io.content_framer(name).ok_or_else(|| {
+                        self.error(
+                            format!("framing `{name}` is not installed"),
+                            expression.span,
+                        )
+                    })?;
+                    let result = if *encode {
+                        mettle_capability::framing::encode(
+                            &input,
+                            installed.as_ref(),
+                            expression.span,
+                            self.io,
+                        )
+                        .await
+                    } else {
+                        mettle_capability::framing::frames(
+                            &input,
+                            installed,
+                            expression.span,
+                            self.io,
+                        )
+                    };
+                    result.map_err(|error| self.error(error.message, error.span))
+                }
+                PlanExpressionKind::ResourceCall {
+                    receiver,
+                    method,
+                    arguments,
+                    named_arguments,
+                } => {
                     let value = self.evaluate(receiver, locals, context).await?;
                     let sensitive = value.is_sensitive();
+                    if let Value::FrameReader(reader) = value.revealed() {
+                        let mut values = Vec::with_capacity(arguments.len());
+                        for argument in arguments {
+                            values.push(self.evaluate(argument, locals, context).await?);
+                        }
+                        let mut named = mettle_capability::Object::new();
+                        for field in named_arguments {
+                            named.insert(
+                                field.name.clone(),
+                                self.evaluate(&field.expression, locals, context).await?,
+                            );
+                        }
+                        let result =
+                            framing::reader_call(reader, method, values, named, expression.span)
+                                .await
+                                .map_err(|error| self.error(error.message, error.span))?;
+                        return Ok(if sensitive {
+                            result.sensitive()
+                        } else {
+                            result
+                        });
+                    }
+                    if !arguments.is_empty() || !named_arguments.is_empty() {
+                        return Err(self.error(
+                            "only a custom framing's read input takes operation arguments",
+                            expression.span,
+                        ));
+                    }
                     let field = value.as_object().and_then(|fields| fields.get(method));
                     let Some(Value::Deferred(field)) = field.map(Value::revealed) else {
                         return Err(

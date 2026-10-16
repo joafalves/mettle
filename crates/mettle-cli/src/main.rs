@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use mettle_capability::IoContext;
 use mettle_capability::codecs::{
-    BYTES_DESCRIPTOR, CodecCapability, JSON_DESCRIPTOR, TEXT_DESCRIPTOR,
+    BYTES_DESCRIPTOR, CONTENT_DESCRIPTOR, CodecCapability, ContentCapability, JSON_DESCRIPTOR,
+    TEXT_DESCRIPTOR,
 };
 use mettle_capability::content::BuiltinCodec;
 use mettle_capability::{CapabilityDescriptor, Object, Value};
@@ -72,6 +73,7 @@ const CAPABILITIES: &[CapabilityDescriptor] = &[
     JSON_DESCRIPTOR,
     TEXT_DESCRIPTOR,
     BYTES_DESCRIPTOR,
+    CONTENT_DESCRIPTOR,
 ];
 
 #[derive(Debug)]
@@ -794,6 +796,7 @@ fn spawn_entry(
             Arc::new(CodecCapability(BuiltinCodec::Json)),
             Arc::new(CodecCapability(BuiltinCodec::Text)),
             Arc::new(CodecCapability(BuiltinCodec::Bytes)),
+            Arc::new(ContentCapability),
         ])
         .with_observer(observer.clone())
         .with_environment(environment)
@@ -1605,7 +1608,6 @@ fn value_from_expression(expression: &Expression) -> Result<Value, &'static str>
         | ExpressionKind::Fail(_)
         | ExpressionKind::Block(_)
         | ExpressionKind::Source(_)
-        | ExpressionKind::ValueStream(_)
         | ExpressionKind::For { .. }
         | ExpressionKind::Member { .. }
         | ExpressionKind::Index { .. }
@@ -1849,6 +1851,14 @@ fn load_sources(
                 codec.decode_flow =
                     flow_ids[codec.decode_flow].expect("named codec decoder retained");
             }
+            for framer in &mut program.framers {
+                if let Some(flow) = &mut framer.read_flow {
+                    *flow = flow_ids[*flow].expect("named framing reader retained");
+                }
+                if let Some(flow) = &mut framer.write_flow {
+                    *flow = flow_ids[*flow].expect("named framing writer retained");
+                }
+            }
         }
         parsed.push(program);
     }
@@ -1869,6 +1879,7 @@ fn combine_parsed_sources(
         file_contexts: Vec::new(),
         codecs: Vec::new(),
         codec_uses: Vec::new(),
+        framers: Vec::new(),
         flows: Vec::new(),
     };
     for mut source in parsed {
@@ -1877,10 +1888,15 @@ fn combine_parsed_sources(
             codec.encode_flow += flow_offset;
             codec.decode_flow += flow_offset;
         }
+        for framer in &mut source.framers {
+            framer.read_flow = framer.read_flow.map(|flow| flow + flow_offset);
+            framer.write_flow = framer.write_flow.map(|flow| flow + flow_offset);
+        }
         program.contexts.extend(source.contexts);
         program.file_contexts.extend(source.file_contexts);
         program.codecs.extend(source.codecs);
         program.codec_uses.extend(source.codec_uses);
+        program.framers.extend(source.framers);
         program.flows.extend(source.flows);
     }
     LoadedProject {

@@ -2,8 +2,8 @@
 
 use super::{
     BinaryOperator, CodecDecl, CodecUse, ContextDecl, ContextMember, DeclarationKind, Expression,
-    ExpressionKind, FileContextUse, IfBranch, MettleDecl, ObjectField, ParallelBranch, Program,
-    Span, Spanned, Statement, SyntaxError, Token, TokenKind, lex,
+    ExpressionKind, FileContextUse, FramerDecl, IfBranch, MettleDecl, ObjectField, ParallelBranch,
+    Program, Span, Spanned, Statement, SyntaxError, Token, TokenKind, lex,
 };
 
 /// Parse a complete Mettle source file.
@@ -46,6 +46,7 @@ impl<'a> Parser<'a> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn parse_program(mut self) -> Result<Program, SyntaxError> {
         let mut namespace = None;
         let mut namespace_uses = Vec::new();
@@ -53,6 +54,7 @@ impl<'a> Parser<'a> {
         let mut file_contexts = Vec::new();
         let mut codecs = Vec::new();
         let mut codec_uses = Vec::new();
+        let mut framers = Vec::new();
         let mut flows = Vec::new();
         while !self.at(&TokenKind::End) {
             if self.at(&TokenKind::Namespace) {
@@ -69,12 +71,24 @@ impl<'a> Parser<'a> {
                 if self.take_if(&TokenKind::Namespace) {
                     namespace_uses.push(self.take_identifier("a namespace name")?);
                 } else if self.take_if(&TokenKind::Codec) {
+                    let name = self.take_identifier("a codec name")?;
+                    if self.at(&TokenKind::LeftBrace) {
+                        let (codec, methods) = self.parse_codec_body(start, name.clone())?;
+                        Self::append_codec(
+                            codec,
+                            methods,
+                            namespace.as_ref(),
+                            &namespace_uses,
+                            &mut flows,
+                            &mut codecs,
+                        );
+                    }
                     codec_uses.push(CodecUse {
                         namespace: namespace
                             .as_ref()
                             .map_or_else(String::new, |name| name.value.clone()),
                         namespace_uses: namespace_uses.clone(),
-                        name: self.take_identifier("a codec name")?,
+                        name,
                     });
                 } else {
                     self.parse_file_context_use(
@@ -93,18 +107,33 @@ impl<'a> Parser<'a> {
                 context.namespace_uses.clone_from(&namespace_uses);
                 contexts.push(context);
             } else if self.at(&TokenKind::Codec) {
-                let (mut codec, mut methods) = self.parse_codec()?;
-                codec.namespace = namespace
+                let start = self.advance().span;
+                let name = self.take_identifier("a codec name")?;
+                let (codec, methods) = self.parse_codec_body(start, name)?;
+                Self::append_codec(
+                    codec,
+                    methods,
+                    namespace.as_ref(),
+                    &namespace_uses,
+                    &mut flows,
+                    &mut codecs,
+                );
+            } else if self.at_framing_declaration() {
+                let (mut framer, mut methods) = self.parse_framing()?;
+                framer.namespace = namespace
                     .as_ref()
                     .map_or_else(String::new, |name| name.value.clone());
-                codec.encode_flow = flows.len();
-                codec.decode_flow = flows.len() + 1;
-                for mut method in methods.drain(..) {
-                    method.namespace.clone_from(&codec.namespace);
-                    method.namespace_uses.clone_from(&namespace_uses);
-                    flows.push(method);
+                framer.namespace_uses.clone_from(&namespace_uses);
+                if !methods.is_empty() {
+                    framer.read_flow = Some(flows.len());
+                    framer.write_flow = Some(flows.len() + 1);
+                    for mut method in methods.drain(..) {
+                        method.namespace.clone_from(&framer.namespace);
+                        method.namespace_uses.clone_from(&namespace_uses);
+                        flows.push(method);
+                    }
                 }
-                codecs.push(codec);
+                framers.push(framer);
             } else if self.at(&TokenKind::Mettle) {
                 let mut flow = self.parse_flow()?;
                 flow.namespace = namespace
@@ -135,6 +164,7 @@ impl<'a> Parser<'a> {
             file_contexts,
             codecs,
             codec_uses,
+            framers,
             flows,
         })
     }
@@ -166,9 +196,30 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn parse_codec(&mut self) -> Result<(CodecDecl, Vec<MettleDecl>), SyntaxError> {
-        let start = self.take(&TokenKind::Codec)?.span;
-        let name = self.take_identifier("a codec name")?;
+    fn append_codec(
+        mut codec: CodecDecl,
+        methods: Vec<MettleDecl>,
+        namespace: Option<&Spanned<String>>,
+        namespace_uses: &[Spanned<String>],
+        flows: &mut Vec<MettleDecl>,
+        codecs: &mut Vec<CodecDecl>,
+    ) {
+        codec.namespace = namespace.map_or_else(String::new, |name| name.value.clone());
+        codec.encode_flow = flows.len();
+        codec.decode_flow = flows.len() + 1;
+        for mut method in methods {
+            method.namespace.clone_from(&codec.namespace);
+            method.namespace_uses = namespace_uses.to_vec();
+            flows.push(method);
+        }
+        codecs.push(codec);
+    }
+
+    fn parse_codec_body(
+        &mut self,
+        start: Span,
+        name: Spanned<String>,
+    ) -> Result<(CodecDecl, Vec<MettleDecl>), SyntaxError> {
         self.take(&TokenKind::LeftBrace)?;
         let mut media_type = None;
         let mut aliases = None;
@@ -241,6 +292,111 @@ impl<'a> Parser<'a> {
             },
             methods,
         ))
+    }
+
+    /// `framing` is contextual; it declares only when followed by a name.
+    fn at_framing_declaration(&self) -> bool {
+        matches!(&self.current().kind, TokenKind::Identifier(name) if name == "framing")
+            && matches!(
+                self.tokens.get(self.cursor + 1).map(|token| &token.kind),
+                Some(TokenKind::Identifier(_))
+            )
+    }
+
+    fn parse_framing(&mut self) -> Result<(FramerDecl, Vec<MettleDecl>), SyntaxError> {
+        let start = self.advance().span;
+        let name = self.take_identifier("a framing name")?;
+        let mut framer = FramerDecl {
+            namespace: String::new(),
+            namespace_uses: Vec::new(),
+            name: name.clone(),
+            builtin: None,
+            max_frame_bytes: None,
+            read_flow: None,
+            write_flow: None,
+            span: start,
+        };
+        if self.take_if(&TokenKind::Equal) {
+            let previous = self.suppress_trailing_options;
+            self.suppress_trailing_options = true;
+            let expression = self.parse_expression();
+            self.suppress_trailing_options = previous;
+            let expression = expression?;
+            if !matches!(expression.kind, ExpressionKind::Call { .. }) {
+                return Err(SyntaxError::new(
+                    "expected a built-in framing such as delimited(\"\\n\"), lengthPrefixed(u32be), or fixed(16)",
+                    expression.span,
+                ));
+            }
+            framer.span = start.join(expression.span);
+            framer.builtin = Some(expression);
+            return Ok((framer, Vec::new()));
+        }
+        if !self.at(&TokenKind::LeftBrace) {
+            return Err(self.expected("`=` and a built-in framing, or a `{` custom framing body"));
+        }
+        self.advance();
+        let mut read = None;
+        let mut write = None;
+        while !self.at(&TokenKind::RightBrace) {
+            if self.at(&TokenKind::End) {
+                return Err(self.expected("a framing member or `}`"));
+            }
+            let member = self.take_identifier("a framing member")?;
+            match member.value.as_str() {
+                "maxFrameBytes" => {
+                    if framer.max_frame_bytes.is_some() {
+                        return Err(SyntaxError::new(
+                            "maxFrameBytes is declared more than once",
+                            member.span,
+                        ));
+                    }
+                    self.take(&TokenKind::Colon)?;
+                    framer.max_frame_bytes = Some(self.parse_expression()?);
+                }
+                "read" | "write" => {
+                    let mut flow = self.parse_codec_method(&name, &member)?;
+                    flow.kind = DeclarationKind::Framing;
+                    let slot = if member.value == "read" {
+                        &mut read
+                    } else {
+                        &mut write
+                    };
+                    if slot.replace(flow).is_some() {
+                        return Err(SyntaxError::new(
+                            format!(
+                                "framing method `{}` is declared more than once",
+                                member.value
+                            ),
+                            member.span,
+                        ));
+                    }
+                }
+                "delimiter" | "mediaType" => {
+                    return Err(SyntaxError::new(
+                        format!(
+                            "`{}` is not a custom framing member: use `framing {} = delimited(...)` for delimited frames, and return mediaType per frame from read",
+                            member.value, name.value
+                        ),
+                        member.span,
+                    ));
+                }
+                _ => {
+                    return Err(SyntaxError::new(
+                        "expected maxFrameBytes, read, or write",
+                        member.span,
+                    ));
+                }
+            }
+            self.require_separator("framing members")?;
+        }
+        let end = self.take(&TokenKind::RightBrace)?.span;
+        framer.span = start.join(end);
+        let read = read
+            .ok_or_else(|| SyntaxError::new("custom framing requires read(input)", framer.span))?;
+        let write = write
+            .ok_or_else(|| SyntaxError::new("custom framing requires write(frame)", framer.span))?;
+        Ok((framer, vec![read, write]))
     }
 
     fn parse_codec_media_type(&mut self) -> Result<Spanned<String>, SyntaxError> {
@@ -704,13 +860,6 @@ impl<'a> Parser<'a> {
                 value
             }
             TokenKind::Identifier(value) => {
-                if value == "stream" && self.at(&TokenKind::LeftBrace) {
-                    let (body, end) = self.parse_statement_block()?;
-                    return self.parse_member_access(literal(
-                        ExpressionKind::ValueStream(body),
-                        token.span.join(end),
-                    ));
-                }
                 let mut name = value;
                 let mut span = token.span;
                 while self.at(&TokenKind::Dot)
@@ -1226,6 +1375,7 @@ const fn token_description(token: &TokenKind) -> &'static str {
         TokenKind::Test => "`test`",
         TokenKind::Context => "`context`",
         TokenKind::Codec => "`codec`",
+        TokenKind::Framing => "`framing`",
         TokenKind::Namespace => "`namespace`",
         TokenKind::Defaults => "`defaults`",
         TokenKind::Use => "`use`",

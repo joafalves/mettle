@@ -35,6 +35,10 @@ const invalid = [
   'flow main = 1 is text',
   'flow main = 1 is',
   'flow as = 1',
+  'codec old { mediaType: "application/x-old"\n encode(value) { text.encode(value) }\n decode(input) { stream { yield input } }\n }',
+  'layout lines { delimiter: "\\n" }',
+  'framing lines { delimiter: "\\n" }',
+  'framing lines = 1',
 ];
 
 function parse(source, options = []) {

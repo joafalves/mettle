@@ -41,7 +41,7 @@ const definition = {
   rules: {
     source_file: $ => repeat(choice(
       $.namespace_declaration, $.namespace_use, $.context_declaration,
-      $.codec_declaration, $.codec_use,
+      $.codec_declaration, $.codec_use, $.framing_declaration,
       $.file_context_use, $.flow_declaration, $.anonymous_flow,
       $.test_declaration, $.call_expression,
     )),
@@ -53,12 +53,20 @@ const definition = {
     ))),
     context_body: $ => block($, choice($.context_use, $.defaults_declaration, $.object_field), true),
     context_use: $ => seq("use", "context", field("name", $.identifier)),
-    codec_use: $ => seq("use", "codec", field("name", $.identifier)),
+    codec_use: $ => prec.right(seq("use", "codec", field("name", $.identifier), optional($.codec_body))),
     codec_declaration: $ => seq("codec", field("name", $.identifier), $.codec_body),
     codec_body: $ => block($, choice($.codec_media_type, $.codec_aliases, $.codec_method), true),
     codec_media_type: $ => seq(field("name", alias("mediaType", $.identifier)), ":", field("value", $.string)),
     codec_aliases: $ => seq(field("name", alias("aliases", $.identifier)), ":", "[", commaSepTrailing($.string), "]"),
     codec_method: $ => seq(field("name", choice("encode", "decode")), "(", field("parameter", $.identifier), ")", field("body", $.block)),
+    // `framing` is contextual: it is not reserved, so other names may use it.
+    framing_declaration: $ => seq("framing", field("name", $.identifier), choice(
+      seq("=", field("value", $.call_expression)),
+      field("body", $.framing_body),
+    )),
+    framing_body: $ => block($, choice($.framing_max_frame_bytes, $.framing_method), true),
+    framing_max_frame_bytes: $ => seq(field("name", alias("maxFrameBytes", $.identifier)), ":", field("value", $.integer)),
+    framing_method: $ => seq(field("name", choice("read", "write")), "(", field("parameter", $.identifier), ")", field("body", $.block)),
     defaults_declaration: $ => seq("defaults", field("capability", $.identifier), $.object),
     flow_declaration: $ => seq("flow", field("name", $.identifier), optional($.parameter_list),
       choice(seq("=", field("body", $._expression)), field("body", $.block))),
@@ -101,7 +109,7 @@ const definition = {
       $.member_expression, $.index_expression,
       $.type_operation,
       $.within_expression, $.retry_expression, $.parallel_expression,
-      $.rate_expression, $.concurrency_expression, $.for_expression, $.fail_expression, $.source_expression, $.stream_expression,
+      $.rate_expression, $.concurrency_expression, $.for_expression, $.fail_expression, $.source_expression,
     ),
     parenthesized_expression: $ => seq("(", $._expression, ")"),
     type_operation: $ => prec.left(PREC.kind, seq(
@@ -147,7 +155,6 @@ const definition = {
     named_branch: $ => seq(field("name", $.identifier), ":", field("value", $._expression)),
     fail_expression: $ => seq("fail", "(", $._expression, ")"),
     source_expression: $ => prec(1, seq("source", $.block)),
-    stream_expression: $ => prec(1, seq("stream", $.block)),
     for_expression: $ => seq("for", optional(seq(field("key", $.identifier), ",")),
       field("value", $.identifier), "in", field("iterable", $._iterable_expression),
       field("body", $.block)),
@@ -185,7 +192,7 @@ const iterableRules = new Set([
   "concurrency_expression", "timeout_option", "attempts_option", "delay_option", "limit_option",
   "target_option", "period_option", "duration_option", "expression_body", "parallel_body",
   "named_branch", "fail_expression", "for_expression", "block", "_statement", "binding",
-  "return_statement", "assert_statement", "if_statement", "expression_statement", "source_expression", "stream_expression", "yield_statement", "break_statement",
+  "return_statement", "assert_statement", "if_statement", "expression_statement", "source_expression", "yield_statement", "break_statement",
 ]);
 const iterableName = name => `_iterable_${name.replace(/^_/, "")}`;
 function inIterable(rule, $) {

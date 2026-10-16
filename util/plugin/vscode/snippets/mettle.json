@@ -3,7 +3,7 @@
     "prefix": "codec",
     "description": "Declare and explicitly register a bounded media-type codec",
     "body": [
-      "codec ${1:name} {",
+      "use codec ${1:name} {",
       "    mediaType: \"${2:application/vnd.example.value}\"",
       "    encode(value) {",
       "        ${3:text.encode(value as string)}",
@@ -11,37 +11,68 @@
       "    decode(bytes) {",
       "        ${4:text.decode(bytes)}",
       "    }",
-      "}",
-      "use codec ${1:name}"
+      "}"
     ]
   },
-  "Incremental codec": {
-    "prefix": "codecstream",
-    "description": "Decode byte sources into a stream of complete native records",
+  "Delimited framing": {
+    "prefix": "framing",
+    "description": "Declare bounded frames separated by a delimiter",
     "body": [
-      "codec ${1:name} {",
-      "    mediaType: \"${2:application/vnd.example.records}\"",
-      "    encode(value) { text.encode(value as string) }",
-      "    decode(input) {",
-      "        stream {",
-      "            for line in text.lines(input) {",
-      "                yield line",
-      "            }",
-      "        }",
+      "framing ${1:records} = delimited(\"${2:\\\\n}\", mediaType: ${3:json.mediaType}, maxFrameBytes: ${4:8192})"
+    ]
+  },
+  "Length-prefixed framing": {
+    "prefix": "framinglength",
+    "description": "Declare bounded frames that follow their unsigned byte length",
+    "body": [
+      "framing ${1:packets} = lengthPrefixed(${2:u32be}, mediaType: ${3:json.mediaType}, maxFrameBytes: ${4:65536})"
+    ]
+  },
+  "Custom framing": {
+    "prefix": "framingcustom",
+    "description": "Declare custom bounded frame read and write methods",
+    "body": [
+      "framing ${1:records} {",
+      "    maxFrameBytes: ${2:8192}",
+      "    read(input) {",
+      "        ${3:body = input.readUntil(\"\\\\n\")}",
+      "        if (body is null) { return null }",
+      "        return { bodyBytes: body, mediaType: ${4:json.mediaType} }",
       "    }",
-      "}",
-      "use codec ${1:name}"
+      "    write(frame) {",
+      "        ${5:bytes.concat([frame.bodyBytes, text.encode(\"\\\\n\")])}",
+      "    }",
+      "}"
+    ]
+  },
+  "Read frames": {
+    "prefix": "frames",
+    "description": "Iterate complete frames lazily from bytes or an owned byte source",
+    "body": [
+      "for ${1:frame} in ${2:records}.frames(${3:response.chunks}) {",
+      "    $0",
+      "}"
     ]
   },
   "Lazy byte producer": {
     "prefix": "source",
     "description": "Produce ordered UTF-8 strings or bytes on demand",
-    "body": ["source {", "    for part in ${1:parts} {", "        yield part", "    }", "}"]
+    "body": [
+      "source {",
+      "    for part in ${1:parts} {",
+      "        yield part",
+      "    }",
+      "}"
+    ]
   },
   "Streamed HTTP response": {
     "prefix": "httpstream",
     "description": "Check response headers before streaming a download to a file",
-    "body": ["response = http.get(\"${1:url}\", stream: true, maxResponseBytes: ${3:104857600})", "assert(response.status == 200)", "fs.write(\"${2:./download.bin}\", response.chunks)"]
+    "body": [
+      "response = http.get(\"${1:url}\", stream: true, maxResponseBytes: ${3:104857600})",
+      "assert(response.status == 200)",
+      "fs.write(\"${2:./download.bin}\", response.chunks)"
+    ]
   },
   "Documented flow": {
     "prefix": "flowdoc",
@@ -252,17 +283,23 @@
   "Complete file read": {
     "prefix": "fsread",
     "description": "Read a bounded file as reusable bytes or UTF-8 text",
-    "body": ["${1:payload} = fs.${2|read,readText|}(\"${3:./payload.txt}\")"]
+    "body": [
+      "${1:payload} = fs.${2|read,readText|}(\"${3:./payload.txt}\")"
+    ]
   },
   "Incremental file copy": {
     "prefix": "fscopy",
     "description": "Copy an incremental source without buffering the whole file",
-    "body": ["fs.write(\"${1:./copy.bin}\", fs.stream(\"${2:./payload.bin}\"))"]
+    "body": [
+      "fs.write(\"${1:./copy.bin}\", fs.stream(\"${2:./payload.bin}\"))"
+    ]
   },
   "Streamed HTTP upload": {
     "prefix": "httpfile",
     "description": "Send a file progressively through an ordinary HTTP call",
-    "body": ["response = http.post(\"${1:/upload}\", body: fs.stream(\"${2:./payload.bin}\"))"]
+    "body": [
+      "response = http.post(\"${1:/upload}\", body: fs.stream(\"${2:./payload.bin}\"))"
+    ]
   },
   "Named parallel": {
     "prefix": "parallel-named",
@@ -277,16 +314,23 @@
   "JSON codec round trip": {
     "prefix": "jsoncodec",
     "description": "Encode a value as bytes and decode it explicitly",
-    "body": ["encoded = json.encode(${1:value})", "decoded = json.decode(encoded)"]
+    "body": [
+      "encoded = json.encode(${1:value})",
+      "decoded = json.decode(encoded)"
+    ]
   },
   "Built-in value kind check": {
     "prefix": "iskind",
     "description": "Check an actual built-in value kind",
-    "body": ["${1:value} is ${2|number,integer,string,boolean,null,bytes,duration,array,object,source|}"]
+    "body": [
+      "${1:value} is ${2|number,integer,string,boolean,null,bytes,duration,array,object,source|}"
+    ]
   },
   "HTTP explicit media type": {
     "prefix": "httpmedia",
     "description": "Select the content representation through a codec constant",
-    "body": ["http.post(\"${1:/path}\", body: ${2:value}, mediaType: ${3|json,text,bytes|}.mediaType)"]
+    "body": [
+      "http.post(\"${1:/path}\", body: ${2:value}, mediaType: ${3|json,text,bytes|}.mediaType)"
+    ]
   }
 }

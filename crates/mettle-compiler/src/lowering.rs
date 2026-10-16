@@ -1,14 +1,15 @@
 //! Semantic lowering and validation.
 
 mod codec;
+mod framing;
 
 use super::{
     BTreeMap, CapabilityDefaultsPlan, CapabilityDescriptor, CodecPlan, CompileError, Constant,
     ContextMember, ContextPlan, DeclarationKind, Duration, ExecutionPlan, Expression,
-    ExpressionKind, FieldSchema, FileContextUse, FlattenedContext, HashMap, HashSet, Instruction,
-    MettleDecl, MettlePlan, NameResolution, ObjectField, PlanExpression, PlanExpressionKind,
-    PlanField, Program, SchemaType, Span, Statement, StringPart, ValueType, VisitState,
-    flow_display_name, is_valid_identifier, merge_context_field, qualified_name,
+    ExpressionKind, FieldSchema, FileContextUse, FlattenedContext, FramerPlan, HashMap, HashSet,
+    Instruction, MettleDecl, MettlePlan, NameResolution, ObjectField, PlanExpression,
+    PlanExpressionKind, PlanField, Program, SchemaType, Span, Statement, StringPart, ValueType,
+    VisitState, flow_display_name, is_valid_identifier, merge_context_field, qualified_name,
     resolve_visible_name, schema_value_type, with_name_suggestion,
 };
 
@@ -85,7 +86,6 @@ struct Compiler<'a> {
     bindings: Vec<super::semantics::BindingSource>,
     loop_depth: usize,
     source_depth: usize,
-    value_stream_depth: usize,
     registered_codecs: Vec<CodecPlan>,
 }
 
@@ -103,7 +103,6 @@ impl<'a> Compiler<'a> {
             bindings: Vec::new(),
             loop_depth: 0,
             source_depth: 0,
-            value_stream_depth: 0,
             registered_codecs: Vec::new(),
         }
     }
@@ -129,17 +128,19 @@ impl<'a> Compiler<'a> {
         self.collect_flow_names();
         self.validate_file_contexts();
         let codecs = self.compile_codecs();
+        let framers = self.compile_framers();
         self.registered_codecs.clone_from(&codecs);
 
         let default_flow = self.flow_ids.get("main").copied();
         let contexts = self.compile_contexts();
         let mut flows = Vec::with_capacity(self.program.flows.len());
         for (flow_id, flow) in self.program.flows.iter().enumerate() {
-            let file_context = if flow.kind == DeclarationKind::Codec {
-                None
-            } else {
-                self.resolve_file_context(flow)
-            };
+            let file_context =
+                if matches!(flow.kind, DeclarationKind::Codec | DeclarationKind::Framing) {
+                    None
+                } else {
+                    self.resolve_file_context(flow)
+                };
             flows.push(self.compile_flow(flow_id, flow, file_context));
         }
         self.validate_codec_bodies(&flows);
@@ -160,6 +161,7 @@ impl<'a> Compiler<'a> {
                 .collect(),
             contexts,
             codecs,
+            framers,
             flows,
             default_flow,
         };
@@ -198,7 +200,7 @@ impl<'a> Compiler<'a> {
     fn collect_flow_names(&mut self) {
         let mut test_names = HashMap::new();
         for (index, flow) in self.program.flows.iter().enumerate() {
-            if flow.kind == DeclarationKind::Codec {
+            if matches!(flow.kind, DeclarationKind::Codec | DeclarationKind::Framing) {
                 continue;
             }
             let Some(name) = &flow.name else {
@@ -663,9 +665,9 @@ impl<'a> Compiler<'a> {
                     stopped = true;
                 }
                 Statement::Yield { expression, span } => {
-                    if self.source_depth == 0 && self.value_stream_depth == 0 {
+                    if self.source_depth == 0 {
                         self.errors.push(CompileError::new(
-                            "`yield` is only allowed in a source or stream producer",
+                            "`yield` is only allowed in a source producer",
                             *span,
                         ));
                     }
@@ -945,7 +947,6 @@ impl<'a> Compiler<'a> {
                 let mut next_slot = locals.values().copied().max().map_or(0, |slot| slot + 1);
                 let flow = self.program.flows[flow_id].clone();
                 let previous_loop = std::mem::replace(&mut self.loop_depth, 0);
-                let previous_stream = std::mem::replace(&mut self.value_stream_depth, 0);
                 self.source_depth += 1;
                 let (instructions, _) = self.compile_statements(
                     flow_id,
@@ -958,47 +959,12 @@ impl<'a> Compiler<'a> {
                 );
                 self.source_depth -= 1;
                 self.loop_depth = previous_loop;
-                self.value_stream_depth = previous_stream;
                 (
                     PlanExpressionKind::Source {
                         instructions,
                         local_count: next_slot,
                     },
                     ValueType::Source,
-                )
-            }
-            ExpressionKind::ValueStream(statements) => {
-                let flow_id = current_flow?;
-                if let Some(span) = expression_block_return(statements) {
-                    self.errors.push(CompileError::new(
-                        "`return` cannot exit a value stream producer; let its block complete",
-                        span,
-                    ));
-                }
-                let mut scope = locals.clone();
-                let mut next_slot = locals.values().copied().max().map_or(0, |slot| slot + 1);
-                let flow = self.program.flows[flow_id].clone();
-                let previous_loop = std::mem::replace(&mut self.loop_depth, 0);
-                let previous_source = std::mem::replace(&mut self.source_depth, 0);
-                self.value_stream_depth += 1;
-                let (instructions, _) = self.compile_statements(
-                    flow_id,
-                    &flow,
-                    statements,
-                    &mut scope,
-                    &mut next_slot,
-                    context,
-                    false,
-                );
-                self.value_stream_depth -= 1;
-                self.source_depth = previous_source;
-                self.loop_depth = previous_loop;
-                (
-                    PlanExpressionKind::ValueStream {
-                        instructions,
-                        local_count: next_slot,
-                    },
-                    ValueType::Stream,
                 )
             }
             ExpressionKind::Block(statements) => {
@@ -1023,7 +989,6 @@ impl<'a> Compiler<'a> {
                 flow.kind = DeclarationKind::Flow;
                 let previous_loop = std::mem::replace(&mut self.loop_depth, 0);
                 let previous_source = std::mem::replace(&mut self.source_depth, 0);
-                let previous_stream = std::mem::replace(&mut self.value_stream_depth, 0);
                 let (instructions, returns_value) = self.compile_statements(
                     flow_id,
                     &flow,
@@ -1035,7 +1000,6 @@ impl<'a> Compiler<'a> {
                 );
                 self.loop_depth = previous_loop;
                 self.source_depth = previous_source;
-                self.value_stream_depth = previous_stream;
                 if !returns_value {
                     self.errors.push(CompileError::new(
                         "execution block must end with a value",
@@ -1615,8 +1579,22 @@ impl<'a> Compiler<'a> {
             });
         }
 
+        if let Some(call) = self.compile_framing_call(
+            current_flow,
+            callee,
+            arguments,
+            named_arguments,
+            options,
+            span,
+            locals,
+            context,
+        ) {
+            return call;
+        }
+
         if let Some((codec_name, method)) = callee.value.rsplit_once('.')
             && matches!(method, "encode" | "decode")
+            && !Self::shadowed_by_local(codec_name, locals)
             && let Some(flow_id) = current_flow
         {
             let owner = &self.program.flows[flow_id];
@@ -1685,9 +1663,12 @@ impl<'a> Compiler<'a> {
             && locals.contains_key(root)
             && !self.capability_ids.contains_key(root)
         {
-            if !arguments.is_empty() || !named_arguments.is_empty() || !options.is_empty() {
+            if !options.is_empty()
+                || ((!arguments.is_empty() || !named_arguments.is_empty())
+                    && !super::documentation::is_frame_reader_method(method))
+            {
                 self.errors.push(CompileError::new(
-                    "owned resource operations currently take no arguments or options",
+                    "only a custom framing's input.readUntil/input.readExactly take arguments; resource operations do not take option blocks",
                     span,
                 ));
                 return None;
@@ -1698,6 +1679,27 @@ impl<'a> Compiler<'a> {
                 kind: PlanExpressionKind::ResourceCall {
                     receiver: Box::new(receiver),
                     method: method.to_owned(),
+                    arguments: arguments
+                        .iter()
+                        .filter_map(|value| {
+                            self.compile_expression(current_flow, value, locals, context)
+                        })
+                        .collect(),
+                    named_arguments: named_arguments
+                        .iter()
+                        .filter_map(|field| {
+                            self.compile_expression(
+                                current_flow,
+                                &field.expression,
+                                locals,
+                                context,
+                            )
+                            .map(|expression| PlanField {
+                                name: field.name.value.clone(),
+                                expression,
+                            })
+                        })
+                        .collect(),
                 },
                 value_type: ValueType::Inferred,
                 span,

@@ -2,7 +2,6 @@
 
 use hyper::header::{CONTENT_ENCODING, CONTENT_TYPE};
 use hyper::{HeaderMap, Method};
-use mettle_capability::content::BuiltinCodec;
 use mettle_capability::media_type::MediaType;
 use mettle_capability::{CapabilityError, IoContext, Span, Value};
 
@@ -49,35 +48,12 @@ pub async fn decode(
         });
     }
     validate_content_encoding(headers, span)?;
-    let custom = media.and_then(|media| context.content_codec(span.source, media));
-    if custom.is_none()
-        && let Some(media) = media
-    {
-        media.validate_encoding(span).map_err(|_| {
-            CapabilityError::new(
-                "HTTP response JSON/text decoding only supports charset=utf-8",
-                span,
-            )
-        })?;
-    }
-    if let Some(custom) = custom {
-        return custom
-            .decode(bytes.clone(), max_bytes, span, context)
-            .await
-            .map_err(|error| {
-                CapabilityError::new(
-                    format!("HTTP response body could not be decoded: {}", error.message),
-                    error.span,
-                )
-            });
-    }
-    media
-        .map_or(BuiltinCodec::Bytes, MediaType::codec)
-        .decode(bytes, max_bytes, span)
+    mettle_capability::content::decode_media(bytes, media, max_bytes, span, context)
+        .await
         .map_err(|error| {
             CapabilityError::new(
                 format!("HTTP response body could not be decoded: {}", error.message),
-                span,
+                error.span,
             )
         })
 }

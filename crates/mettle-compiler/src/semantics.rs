@@ -462,9 +462,6 @@ impl Analyzer<'_> {
                 } else {
                     self.flow(*called, depth + 1)
                 };
-                if !encode && result.kind == ValueType::Stream {
-                    result.kind = ValueType::Array;
-                }
                 result.sensitivity = composite(result.sensitivity, input.sensitivity);
                 result
             }
@@ -472,13 +469,36 @@ impl Analyzer<'_> {
                 self.block(instructions, &mut locals.clone(), flow, context, depth + 1);
                 ValueInfo::new(ValueType::Source, Sensitivity::Unknown)
             }
-            PlanExpressionKind::ValueStream { instructions, .. } => {
-                self.block(instructions, &mut locals.clone(), flow, context, depth + 1);
-                ValueInfo::new(ValueType::Stream, Sensitivity::Unknown)
+            PlanExpressionKind::FramingCall {
+                encode, argument, ..
+            } => {
+                let input = self.expression(argument, locals, flow, context, depth + 1);
+                let kind = if *encode {
+                    ValueType::Bytes
+                } else {
+                    ValueType::Stream
+                };
+                ValueInfo::new(kind, composite(Sensitivity::Public, input.sensitivity))
             }
-            PlanExpressionKind::ResourceCall { receiver, .. } => {
-                self.expression(receiver, locals, flow, context, depth + 1);
-                ValueInfo::new(ValueType::Null, Sensitivity::Unknown)
+            PlanExpressionKind::ResourceCall {
+                receiver,
+                method,
+                arguments,
+                named_arguments,
+            } => {
+                let receiver = self.expression(receiver, locals, flow, context, depth + 1);
+                for argument in arguments
+                    .iter()
+                    .chain(named_arguments.iter().map(|field| &field.expression))
+                {
+                    self.expression(argument, locals, flow, context, depth + 1);
+                }
+                let kind = match method.as_str() {
+                    "readExactly" => ValueType::Bytes,
+                    "readUntil" => ValueType::Inferred,
+                    _ => ValueType::Null,
+                };
+                ValueInfo::new(kind, composite(Sensitivity::Unknown, receiver.sensitivity))
             }
             PlanExpressionKind::Constant(_) => {
                 ValueInfo::new(expression.value_type, Sensitivity::Public)

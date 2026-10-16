@@ -51,6 +51,7 @@ pub struct Program {
     pub file_contexts: Vec<FileContextUse>,
     pub codecs: Vec<CodecDecl>,
     pub codec_uses: Vec<CodecUse>,
+    pub framers: Vec<FramerDecl>,
     pub flows: Vec<MettleDecl>,
 }
 
@@ -109,6 +110,19 @@ impl Program {
         for codec in &mut self.codec_uses {
             codec.name.span = codec.name.span.with_source(source);
         }
+        for framer in &mut self.framers {
+            framer.span = framer.span.with_source(source);
+            framer.name.span = framer.name.span.with_source(source);
+            for namespace in &mut framer.namespace_uses {
+                namespace.span = namespace.span.with_source(source);
+            }
+            if let Some(builtin) = &mut framer.builtin {
+                set_expression_source(builtin, source);
+            }
+            if let Some(max_frame_bytes) = &mut framer.max_frame_bytes {
+                set_expression_source(max_frame_bytes, source);
+            }
+        }
         for flow in &mut self.flows {
             flow.span = flow.span.with_source(source);
             if let Some(name) = &mut flow.name {
@@ -138,27 +152,25 @@ pub struct CodecDecl {
     pub span: Span,
 }
 
-impl CodecDecl {
-    /// Whether the decoder produces native records from a byte source.
-    #[must_use]
-    pub fn is_incremental(&self, program: &Program) -> bool {
-        program.flows[self.decode_flow]
-            .body
-            .last()
-            .is_some_and(|statement| {
-                matches!(statement,
-                    Statement::Expression(expression) | Statement::Return { expression, .. }
-                    if matches!(expression.kind, ExpressionKind::ValueStream(_))
-                )
-            })
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct CodecUse {
     pub namespace: String,
     pub namespace_uses: Vec<Spanned<String>>,
     pub name: Spanned<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FramerDecl {
+    pub namespace: String,
+    pub namespace_uses: Vec<Spanned<String>>,
+    pub name: Spanned<String>,
+    /// Built-in form `framing name = delimited(...)`; the compiler validates it.
+    pub builtin: Option<Expression>,
+    /// Optional `maxFrameBytes` member of the custom read/write form.
+    pub max_frame_bytes: Option<Expression>,
+    pub read_flow: Option<usize>,
+    pub write_flow: Option<usize>,
+    pub span: Span,
 }
 
 fn set_statement_source(statement: &mut Statement, source: usize) {
@@ -229,9 +241,7 @@ fn set_expression_source(expression: &mut Expression, source: usize) {
                 set_field_source(field, source);
             }
         }
-        ExpressionKind::Block(statements)
-        | ExpressionKind::Source(statements)
-        | ExpressionKind::ValueStream(statements) => {
+        ExpressionKind::Block(statements) | ExpressionKind::Source(statements) => {
             for statement in statements {
                 set_statement_source(statement, source);
             }
@@ -411,6 +421,7 @@ pub enum DeclarationKind {
     Flow,
     Test,
     Codec,
+    Framing,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -494,7 +505,6 @@ pub enum ExpressionKind {
     Object(Vec<ObjectField>),
     Block(Vec<Statement>),
     Source(Vec<Statement>),
-    ValueStream(Vec<Statement>),
     Fail(Box<Expression>),
     For {
         key: Option<Spanned<String>>,
@@ -661,6 +671,7 @@ enum TokenKind {
     Test,
     Context,
     Codec,
+    Framing,
     Namespace,
     Defaults,
     Use,
@@ -796,8 +807,11 @@ fn lex_identifier(source: &str, cursor: &mut usize) -> Token {
         *cursor += 1;
     }
     let text = &source[start..*cursor];
-    let kind =
-        language::keyword_token(text).unwrap_or_else(|| TokenKind::Identifier(text.to_owned()));
+    // `framing` is contextual: the parser recognizes it only where a
+    // declaration starts, so existing names keep working.
+    let kind = language::keyword_token(text)
+        .filter(|kind| *kind != TokenKind::Framing)
+        .unwrap_or_else(|| TokenKind::Identifier(text.to_owned()));
     Token {
         kind,
         span: Span::new(start, *cursor),
@@ -1502,5 +1516,67 @@ mod tests {
         };
         assert_eq!(target.span.source, 7);
         assert_eq!(value.span.source, 7);
+    }
+
+    #[test]
+    fn framing_is_a_contextual_declaration_with_builtin_and_custom_forms() {
+        let mut program = super::parse(
+            r#"framing lines = delimited("\n", mediaType: json.mediaType)
+            framing records {
+                maxFrameBytes: 4096
+                read(input) { input.readExactly(4) }
+                write(frame) { frame.bodyBytes }
+            }
+            flow main {
+                framing = { layout: 1 }
+                framing.layout
+            }"#,
+        )
+        .unwrap();
+        program.set_source(3);
+        assert_eq!(program.framers.len(), 2);
+        let lines = &program.framers[0];
+        assert_eq!(lines.name.value, "lines");
+        let Some(builtin) = &lines.builtin else {
+            panic!("expected a built-in framing");
+        };
+        let ExpressionKind::Call {
+            callee,
+            named_arguments,
+            ..
+        } = &builtin.kind
+        else {
+            panic!("expected a framing call");
+        };
+        assert_eq!(callee.value, "delimited");
+        assert_eq!(named_arguments[0].name.value, "mediaType");
+        assert_eq!(builtin.span.source, 3);
+        let records = &program.framers[1];
+        assert!(records.builtin.is_none());
+        assert_eq!(records.max_frame_bytes.as_ref().unwrap().span.source, 3);
+        let read = records.read_flow.unwrap();
+        assert_eq!(program.flows[read].kind, super::DeclarationKind::Framing);
+        assert_eq!(records.write_flow, Some(read + 1));
+        assert!(program.flows[2].name.is_some());
+
+        for (source, message) in [
+            ("framing a = 1", "built-in framing"),
+            (
+                "framing a { delimiter: \"\\n\" }",
+                "not a custom framing member",
+            ),
+            (
+                "framing a { read(input) { null } }",
+                "requires write(frame)",
+            ),
+            (
+                "framing a { write(frame) { frame } }",
+                "requires read(input)",
+            ),
+            ("framing a", "`=` and a built-in framing"),
+        ] {
+            let error = super::parse(source).unwrap_err();
+            assert!(error.message.contains(message), "{source}: {error:?}");
+        }
     }
 }

@@ -39,11 +39,12 @@ decompression is not implemented. Error HTTP statuses still return normally
 when their metadata/content are valid.
 
 Response `.json` is removed: use `.body` for decoded values or explicitly decode
-`.bodyBytes`. Custom codecs require explicit file-level registration. Their
-`decode` method returns either one value from complete bytes or a value stream
-from an owned byte source. With `stream: true`, an incremental decoder feeds
-`.body` lazily; ordinary buffered calls collect a bounded array. `response.chunks`
-remains raw and competes for the same one-consumer body. Built-in SSE decoding
-also exposes events through streamed `.body`, without automatic reconnection.
+`.bodyBytes`. Custom codecs require explicit file-level registration; their
+`decode(bytes)` method always returns one value from complete bytes. A streamed
+response normally captures a bounded `.body` or exposes raw `response.chunks`.
+Declare a `framing` and iterate `name.frames(response.chunks)` to pull complete
+frames from those raw chunks and decode each body by its media type. Capture and
+raw chunks compete for the same one-consumer body. Built-in SSE decoding still
+exposes events through streamed `.body`, without automatic reconnection.
 Complete conversion is bounded to 10 MiB and 30 seconds. HTTP/2 and compression
 remain future work.

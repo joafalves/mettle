@@ -1172,6 +1172,7 @@ pub fn value_json(value: &Value) -> serde_json::Value {
                 .map(|(name, value)| (name.clone(), value_json(value)))
                 .collect(),
         ),
+        Value::FrameReader(_) => serde_json::Value::String("<frame reader>".to_owned()),
         Value::Sensitive(_) => serde_json::Value::String("[REDACTED]".to_owned()),
     }
 }

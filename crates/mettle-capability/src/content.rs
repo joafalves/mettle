@@ -7,6 +7,50 @@ use serde::Serialize;
 use serde::ser::{Error as _, SerializeMap, SerializeSeq};
 
 use crate::{CapabilityError, Span, Value};
+use crate::{IoContext, media_type::MediaType};
+
+/// Decode complete representation bytes using a file-registered codec first,
+/// then the protocol-independent built-in representation rules.
+/// # Errors
+/// Returns a media-type, codec, or size error for invalid representations.
+pub async fn decode_media(
+    bytes: &Value,
+    media: Option<&MediaType>,
+    max_bytes: usize,
+    span: Span,
+    context: &IoContext,
+) -> Result<Value, CapabilityError> {
+    if let Some(media) = media {
+        if let Some(codec) = context.content_codec(span.source, media) {
+            return codec.decode(bytes.clone(), max_bytes, span, context).await;
+        }
+        media.validate_encoding(span)?;
+    }
+    media
+        .map_or(BuiltinCodec::Bytes, MediaType::codec)
+        .decode(bytes, max_bytes, span)
+}
+
+/// Encode one native value using a registered codec or a built-in media type.
+/// Complete bytes are already encoded and remain unchanged.
+/// # Errors
+/// Returns a codec, media-type, or size error.
+pub async fn encode_media(
+    value: &Value,
+    media: &MediaType,
+    max_bytes: usize,
+    span: Span,
+    context: &IoContext,
+) -> Result<Value, CapabilityError> {
+    if matches!(value.revealed(), Value::Bytes(_)) {
+        return BuiltinCodec::Bytes.encode(value, max_bytes, span);
+    }
+    if let Some(codec) = context.content_codec(span.source, media) {
+        return codec.encode(value.clone(), max_bytes, span, context).await;
+    }
+    media.validate_encoding(span)?;
+    media.codec().encode(value, max_bytes, span)
+}
 
 // serde_json's default recursion budget accepts at most 127 nested containers.
 // Encoding must not produce content that our own decoder cannot read back.

@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::framing::{ContentFramer, FramerBinding};
 use crate::{CapabilityError, Span, Value};
 
 pub const CHUNK_BYTES: usize = 64 * 1024;
@@ -28,9 +29,10 @@ struct Resources {
     temporary: Mutex<Vec<PathBuf>>,
     owned: Mutex<Vec<Weak<dyn IoResource>>>,
     codecs: Mutex<Vec<CodecBinding>>,
+    framers: Mutex<Vec<FramerBinding>>,
 }
 
-/// One registered processor with a complete or incremental decoder.
+/// One registered complete-value content processor.
 pub trait ContentCodec: Send + Sync {
     fn encode<'a>(
         &'a self,
@@ -46,25 +48,6 @@ pub trait ContentCodec: Send + Sync {
         span: Span,
         context: &'a IoContext,
     ) -> crate::CapabilityFuture<'a>;
-
-    fn incremental(&self) -> bool {
-        false
-    }
-
-    fn decode_source<'a>(
-        &'a self,
-        _source: Value,
-        _max_bytes: usize,
-        span: Span,
-        _context: &'a IoContext,
-    ) -> crate::CapabilityFuture<'a> {
-        Box::pin(async move {
-            Err(CapabilityError::new(
-                "codec has no incremental decoder",
-                span,
-            ))
-        })
-    }
 }
 
 pub struct CodecBinding {
@@ -105,6 +88,7 @@ impl IoContext {
             temporary: Mutex::new(Vec::new()),
             owned: Mutex::new(Vec::new()),
             codecs: Mutex::new(Vec::new()),
+            framers: Mutex::new(Vec::new()),
         }))
     }
 
@@ -244,6 +228,36 @@ impl IoContext {
             .iter()
             .find(|binding| binding.source == source && binding.media_type == name)
             .map(|binding| binding.codec.clone())
+    }
+
+    /// Install compile-validated framing declarations for this execution.
+    /// # Errors
+    /// Fails if a framing registry is already installed in this context.
+    pub fn install_framers(&self, bindings: Vec<FramerBinding>) -> Result<(), CapabilityError> {
+        let mut current = self
+            .0
+            .framers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !current.is_empty() {
+            return Err(CapabilityError::new(
+                "framing registry is already installed",
+                Span::default(),
+            ));
+        }
+        *current = bindings;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn content_framer(&self, name: &str) -> Option<Arc<dyn ContentFramer>> {
+        self.0
+            .framers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|binding| binding.name == name)
+            .map(|binding| binding.framer.clone())
     }
 
     /// Run filesystem work off the executor and retain ownership if its waiter drops.

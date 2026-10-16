@@ -1,5 +1,7 @@
 //! Built-in codec capabilities exposed through the same compiler interface as I/O.
 
+use std::sync::Arc;
+
 use crate::content::BuiltinCodec;
 #[path = "text_ops.rs"]
 mod text_ops;
@@ -150,6 +152,36 @@ const BYTE_OPERATIONS: &[OperationSchema] = &[
         mutually_exclusive: &[],
         result: SchemaType::Bytes,
     },
+    OperationSchema {
+        name: "length",
+        documentation: OperationDocumentation {
+            summary: "Return the number of bytes in a complete byte value.",
+            notes: &["This does not consume a live source or count characters in a string."],
+            parameters: &["Complete reusable bytes to measure."],
+            details: "Useful for explicit length-prefixed framing.",
+            example: "bytes.length(json.encode({ ok: true }))",
+        },
+        parameters: &[SchemaType::Bytes],
+        parameter_names: &["value"],
+        options: &[],
+        mutually_exclusive: &[],
+        result: SchemaType::Integer,
+    },
+    OperationSchema {
+        name: "concat",
+        documentation: OperationDocumentation {
+            summary: "Join a bounded array of complete byte values without text conversion.",
+            notes: &["No live source is consumed implicitly."],
+            parameters: &["Array of complete byte values in output order."],
+            details: "Use when writing a length-prefixed frame from encoded header and body bytes.",
+            example: "bytes.concat([text.encode(\"header\\n\"), json.encode({ ok: true })])",
+        },
+        parameters: &[SchemaType::Array],
+        parameter_names: &["parts"],
+        options: OPTIONS,
+        mutually_exclusive: &[],
+        result: SchemaType::Bytes,
+    },
 ];
 
 pub const JSON_DESCRIPTOR: CapabilityDescriptor = CapabilityDescriptor {
@@ -189,6 +221,115 @@ pub const BYTES_DESCRIPTOR: CapabilityDescriptor = CapabilityDescriptor {
     operations: BYTE_OPERATIONS,
 };
 
+/// Convert complete bytes using their declared representation, independent of a protocol.
+pub const CONTENT_DESCRIPTOR: CapabilityDescriptor = CapabilityDescriptor {
+    removed_result_fields: &[],
+    name: "content",
+    description: "Decode complete representation bytes by media type using a file-registered codec or a built-in fallback.",
+    constants: &[],
+    defaults: &[],
+    operations: &[OperationSchema {
+        name: "decode",
+        documentation: OperationDocumentation {
+            summary: "Decode complete bytes using the registered codec for mediaType, then built-in JSON/text/bytes rules.",
+            notes: &[
+                "A media type is representation metadata, not a transport header. Unknown types remain bytes; no codec is loaded from a remote value.",
+            ],
+            parameters: &[
+                "Complete encoded bytes; a live source must first be framed or collected explicitly.",
+            ],
+            details: "The calling file must register a custom codec with `use codec`. Decoding is bounded and preserves sensitivity.",
+            example: "content.decode(json.encode({ ok: true }), mediaType: json.mediaType)",
+        },
+        parameters: &[SchemaType::Bytes],
+        parameter_names: &["bytes"],
+        options: &[
+            FieldSchema::new("mediaType", SchemaType::String)
+                .documented("Concrete media type selecting the decoder."),
+            FieldSchema::new("maxBytes", SchemaType::Integer)
+                .documented("Positive limit for complete input and decoded output.")
+                .with_default(DefaultValue::Bytes(crate::DEFAULT_READ_BYTES)),
+        ],
+        mutually_exclusive: &[],
+        result: SchemaType::Value,
+    }],
+};
+
+#[derive(Debug)]
+pub struct ContentCapability;
+
+impl Capability for ContentCapability {
+    fn name(&self) -> &'static str {
+        "content"
+    }
+    fn operation_name(&self, _: usize) -> &'static str {
+        "decode"
+    }
+    fn invoke(&self, _: usize, _: Vec<Value>, _: Object, span: Span) -> CapabilityFuture<'_> {
+        Box::pin(async move {
+            Err(CapabilityError::new(
+                "content.decode requires an execution context",
+                span,
+            ))
+        })
+    }
+    fn invoke_with_context<'a>(
+        &'a self,
+        operation: usize,
+        arguments: Vec<Value>,
+        options: Object,
+        span: Span,
+        context: &'a crate::IoContext,
+    ) -> CapabilityFuture<'a> {
+        Box::pin(async move {
+            if operation != 0 {
+                return Err(CapabilityError::new("unknown content operation", span));
+            }
+            let bytes = arguments
+                .first()
+                .ok_or_else(|| CapabilityError::new("content.decode requires bytes", span))?;
+            if !matches!(bytes.revealed(), Value::Bytes(_)) {
+                return Err(CapabilityError::new(
+                    "content.decode requires complete bytes",
+                    span,
+                ));
+            }
+            let media = match options.get("mediaType").map(Value::revealed) {
+                Some(Value::String(value)) => {
+                    Some(crate::media_type::MediaType::parse(value, span)?)
+                }
+                None => {
+                    return Err(CapabilityError::new(
+                        "content.decode requires mediaType",
+                        span,
+                    ));
+                }
+                _ => return Err(CapabilityError::new("mediaType must be a string", span)),
+            };
+            let max_bytes = match options.get("maxBytes").map(Value::revealed) {
+                None => usize::try_from(DEFAULT_READ_BYTES).expect("default read bound"),
+                Some(Value::Integer(value)) if *value > 0 => usize::try_from(*value)
+                    .map_err(|_| CapabilityError::new("maxBytes is too large", span))?,
+                _ => {
+                    return Err(CapabilityError::new(
+                        "maxBytes must be a positive integer",
+                        span,
+                    ));
+                }
+            };
+            crate::content::decode_media(bytes, media.as_ref(), max_bytes, span, context).await
+        })
+    }
+    fn observed_result(&self, _: usize, result: &Value) -> Value {
+        let value = Value::String(format!("{} value", result.type_name()));
+        if result.contains_sensitive() {
+            value.sensitive()
+        } else {
+            value
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CodecCapability(pub BuiltinCodec);
 impl Capability for CodecCapability {
@@ -209,6 +350,8 @@ impl Capability for CodecCapability {
             5 if self.0 == BuiltinCodec::Text => "findAll",
             6 if self.0 == BuiltinCodec::Text => "replace",
             7 if self.0 == BuiltinCodec::Text => "lines",
+            2 if self.0 == BuiltinCodec::Bytes => "length",
+            3 if self.0 == BuiltinCodec::Bytes => "concat",
             _ => "unknown",
         }
     }
@@ -220,6 +363,66 @@ impl Capability for CodecCapability {
         span: Span,
     ) -> CapabilityFuture<'_> {
         Box::pin(async move {
+            if self.0 == BuiltinCodec::Bytes && operation == 2 {
+                let value = arguments
+                    .first()
+                    .ok_or_else(|| CapabilityError::new("bytes.length requires bytes", span))?;
+                let Value::Bytes(bytes) = value.revealed() else {
+                    return Err(CapabilityError::new(
+                        "bytes.length requires complete bytes",
+                        span,
+                    ));
+                };
+                let length = i64::try_from(bytes.len())
+                    .map_err(|_| CapabilityError::new("byte length is too large", span))?;
+                let result = Value::Integer(length);
+                return Ok(if value.contains_sensitive() {
+                    result.sensitive()
+                } else {
+                    result
+                });
+            }
+            if self.0 == BuiltinCodec::Bytes && operation == 3 {
+                let value = arguments
+                    .first()
+                    .ok_or_else(|| CapabilityError::new("bytes.concat requires an array", span))?;
+                let Value::Array(parts) = value.revealed() else {
+                    return Err(CapabilityError::new("bytes.concat requires an array", span));
+                };
+                let max_bytes = match options.get("maxBytes").map(Value::revealed) {
+                    None => usize::try_from(DEFAULT_READ_BYTES).expect("default content bound"),
+                    Some(Value::Integer(value)) if *value > 0 => usize::try_from(*value)
+                        .map_err(|_| CapabilityError::new("maxBytes is too large", span))?,
+                    _ => {
+                        return Err(CapabilityError::new(
+                            "maxBytes must be a positive integer",
+                            span,
+                        ));
+                    }
+                };
+                let mut output = Vec::new();
+                for part in parts {
+                    let Value::Bytes(bytes) = part.revealed() else {
+                        return Err(CapabilityError::new(
+                            "bytes.concat array must contain only bytes",
+                            span,
+                        ));
+                    };
+                    if bytes.len() > max_bytes.saturating_sub(output.len()) {
+                        return Err(CapabilityError::new(
+                            "bytes.concat output exceeds maxBytes",
+                            span,
+                        ));
+                    }
+                    output.extend_from_slice(bytes);
+                }
+                let result = Value::Bytes(Arc::from(output));
+                return Ok(if value.contains_sensitive() {
+                    result.sensitive()
+                } else {
+                    result
+                });
+            }
             if self.0 == BuiltinCodec::Text && operation >= 2 {
                 if operation == 7 {
                     return Err(CapabilityError::new(
